@@ -1,0 +1,25 @@
+# 合同 AI 审查与知识库检索 — Python 依赖
+
+# PDF 处理
+pymupdf>=1.23.0
+
+# OCR / 图像 (备选)
+# pytesseract>=0.3.10
+# pdf2image>=1.16.3
+
+# LLM API
+anthropic>=0.39.0
+openai>=1.0.0
+
+# Embedding
+chromadb>=0.5.0
+sentence-transformers>=2.2.0   # 本地 Embedding
+
+# 检索
+rank-bm25>=0.2.2
+
+# 工具
+python-dotenv>=1.0.0
+
+# 数据处理
+numpy>=1.24.0
