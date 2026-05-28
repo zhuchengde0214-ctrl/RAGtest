@@ -12,7 +12,7 @@
 ## 2. 目录结构
 
 ```
-contract-ai-test/
+.
 ├── README.md                  本文件
 ├── .env.example               环境变量模板（.env 已 gitignore）
 ├── requirements.txt
@@ -149,24 +149,9 @@ PDF (52 页扫描件)
 5. **本地 embedding 中文表达力**：默认 `all-MiniLM-L6-v2` 对中文法律术语支持有限，BM25 + 2-gram 是主力召回手段
 6. **LLM 输出格式**：尽量要求结构化 JSON；解析失败兜底走 quote 反查 → 几乎不会出现"无引用"的情况
 
-## 9. 评审无法复现时的应对
+## 9. 无法复现时的应对
 
 - **没有 Anthropic key**：无法做 OCR / QA / 审查；可仅检查 `outputs/parsed_document.json` 与 `outputs/chunks.json`（如已附带）
 - **没有 OpenAI key**：默认就是本地 embedding，不受影响
 - **网络受限装不了 sentence-transformers**：retriever 会自动降级为纯 BM25，仍可工作
 
-## 10. 与题目要求的对应
-
-| 题目要求 | 实现位置 |
-|---|---|
-| qa_results.json 含 citations / retrieval_notes / confidence | `qa_engine.py` 输出契约 + `outputs/qa_results.json` |
-| 引用能定位章节/表格/图示/附件 | chunk metadata: `section_path / table_id / block_type / page_hint` |
-| review_results.json severity ∈ low/medium/high + 原文证据 | `review_engine.py` + 证据回链 |
-| 不"一次性把全文塞给大模型" | 分维度定向检索；每维度独立 prompt |
-| 多轮改写 + 上下文指代 | `retriever.rewrite_query` + 历史进 prompt |
-| 复杂推理区分 fact / inference / human_review | Q3 输出 `conflicts[].conclusion_class` |
-| 表格/图示/签署独立处理 | parser block_type + chunker 分组 |
-| OCR 不确定项进入人工复核 | `[?]` 占位 + needs_review 维度 |
-| 至少 6 条风险 | 10 维度，单维度多条 |
-| 至少 3 个 bad case | `docs/bad_cases.md` 5 个 |
-| .env.example 不含真实 key | `.env.example` 占位 + `.gitignore` 屏蔽 .env |

@@ -87,8 +87,8 @@
 
 | Case | 怎么复现 |
 |---|---|
-| 1 | `python3 src/main.py --max-pages 6` 后查看 `chunks.json` 中 `block_type=table` chunk 的 `pages` 字段 |
+| 1 | `python3 src/main.py --max-pages 6` 后查看 `outputs/chunks.json` 中 `block_type=table` chunk 的 `pages` 字段 |
 | 2 | 删除 `outputs/qa_results.json` 重跑，对比 Q2-2 的 `rewritten_question` 字段 |
-| 3 | 检查 `parsed_document.json` 中 `block_type=signature` 与 `needs_review=true` 的 block |
+| 3 | 检查 `outputs/parsed_document.json` 中 `block_type=signature` 与 `needs_review=true` 的 block |
 | 4 | 在 retriever 上用 `search('赔偿上限', top_k=5)` vs `search('违约责任', top_k=5)` 对比命中差异 |
-| 5 | 检查 `qa_results.json` 中 Q3 的 `conflicts[].evidence`，看是否有 `pages` 涉及附件页 |
+| 5 | 检查 `outputs/qa_results.json` 中 Q3 的 `conflicts[].evidence`，看是否有 `pages` 涉及附件页 |
