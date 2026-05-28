@@ -1,26 +1,25 @@
 @echo off
 REM 合同 AI 审查与知识库检索 — Windows 运行脚本
-REM 请先编辑 .env 文件，填入 ANTHROPIC_API_KEY
 
 cd /d "%~dp0"
-echo ========================================
-echo 合同 AI 审查与知识库检索
-echo ========================================
-echo.
-echo 确认 .env 中已配置 ANTHROPIC_API_KEY...
-echo.
+echo ==============================================
+echo   合同 AI 审查与知识库检索
+echo ==============================================
 
-REM 使用项目自带的 portable Python
-set PYTHON_EXE=%~dp0python-portable\python.exe
+if "%PYTHON_EXE%"=="" set PYTHON_EXE=python
 
-echo Python: %PYTHON_EXE%
+echo Python  : %PYTHON_EXE%
+echo Workdir : %CD%
 echo.
 
-%PYTHON_EXE% src\main.py --pdf "data\AI知识库-综合测试文档.pdf" --output-dir "outputs"
+if not exist .env (
+  echo [警告] 未找到 .env，将复制 .env.example 作为模板，请编辑后再运行。
+  copy .env.example .env >nul
+  exit /b 1
+)
 
-echo.
-echo ========================================
-echo 运行完成！
-echo 结果文件在 outputs\ 目录中
-echo ========================================
-pause
+if "%~1"=="" (
+  %PYTHON_EXE% src\main.py --pdf "data\AI知识库-综合测试文档.pdf" --output-dir "outputs"
+) else (
+  %PYTHON_EXE% src\main.py %*
+)

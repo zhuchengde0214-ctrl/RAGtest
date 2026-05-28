@@ -1,343 +1,418 @@
 """
 检索模块
 
-检索策略：
-1. Dense Retrieval: embedding 向量检索（ChromaDB）
-2. Sparse Retrieval: BM25 关键词检索（rank_bm25）
-3. Hybrid Search: 加权融合 dense + sparse 结果
-4. Rerank: 使用 LLM 对候选结果重排序
+特性：
+- Dense: ChromaDB + 可切换 OpenAI / 本地 SentenceTransformer
+- Sparse: BM25 (rank_bm25) + jieba 中文分词 + 2-gram 兜底
+- Hybrid: Reciprocal Rank Fusion (RRF) + 可选加权分融合
+- Rerank: 可选 LLM rerank
+- 证据回链: locate_evidence(quote) → 找到原文 chunk
+- 多轮: rewrite_query 用 LLM 做指代消解（保留前轮关键实体）
 
-多轮问答策略：
-- 维护对话历史
-- 对追问进行问题改写（指代消解）
-- 改写后的 query 重新检索
-- 引用延续：追踪前轮引用的上下文
+降级路径：
+- 本地 embedding 模型不可用 → 自动跳过 dense，纯 BM25
+- ChromaDB 持久化失败 → 内存模式
 """
 
 import json
 import logging
 import os
+import re
+from dataclasses import dataclass
 from typing import Optional
 
 import chromadb
 from chromadb.config import Settings as ChromaSettings
+import jieba
 from rank_bm25 import BM25Okapi
 
 from chunker import Chunk
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger(__name__)
 
+# 关闭 jieba 启动日志
+jieba.setLogLevel(logging.WARNING)
 
+
+# ------------------------------------------------------------------
+# Embedding
+# ------------------------------------------------------------------
 class EmbeddingProvider:
-    """Embedding 提供者 — 支持 OpenAI API 和本地模型"""
-
-    def __init__(self, use_local: bool = False, openai_api_key: Optional[str] = None, model: str = "text-embedding-3-small"):
-        self.use_local = use_local
-        self.model_name = model
-
-        if use_local:
-            from sentence_transformers import SentenceTransformer
-            logger.info(f"加载本地 Embedding 模型: {model}")
-            self._local_model = SentenceTransformer(model)
-        else:
-            self._openai_key = openai_api_key or os.environ.get("OPENAI_API_KEY")
-            self._openai_model = model
-
-    def embed(self, texts: list[str]) -> list[list[float]]:
-        """生成 embedding 向量"""
-        if self.use_local:
-            return self._local_model.encode(texts, normalize_embeddings=True).tolist()
-        else:
-            from openai import OpenAI
-            client = OpenAI(api_key=self._openai_key)
-            resp = client.embeddings.create(model=self._openai_model, input=texts)
-            return [d.embedding for d in resp.data]
-
-    def embed_query(self, query: str) -> list[float]:
-        """生成查询 embedding"""
-        return self.embed([query])[0]
-
-
-class Retriever:
-    """混合检索引擎"""
+    """支持 OpenAI / 本地 sentence-transformers / 纯关键词降级"""
 
     def __init__(
         self,
+        use_local: bool = False,
+        openai_api_key: Optional[str] = None,
+        model: str = "text-embedding-3-small",
+        local_model: str = "all-MiniLM-L6-v2",
+    ):
+        self.use_local = use_local
+        self.disabled = False
+        self.model_name = local_model if use_local else model
+        self._local = None
+        self._openai_key = openai_api_key or os.environ.get("OPENAI_API_KEY")
+        self._openai_model = model
+        self._local_model_name = local_model
+
+        if use_local:
+            try:
+                from sentence_transformers import SentenceTransformer
+                logger.info(f"加载本地 Embedding 模型: {local_model}")
+                self._local = SentenceTransformer(local_model)
+            except Exception as e:
+                logger.warning(f"本地 Embedding 加载失败，将禁用 dense 检索: {e}")
+                self.disabled = True
+        else:
+            if not self._openai_key or self._openai_key.startswith("sk-xxxx"):
+                logger.warning("未检测到有效 OPENAI_API_KEY，dense 检索禁用")
+                self.disabled = True
+
+    def embed(self, texts: list[str]) -> list[list[float]]:
+        if self.disabled:
+            return []
+        if self.use_local:
+            return self._local.encode(texts, normalize_embeddings=True).tolist()
+        from openai import OpenAI
+        client = OpenAI(api_key=self._openai_key)
+        # OpenAI 单次最多 ~2048 个输入；这里 batch 已在外部控制
+        resp = client.embeddings.create(model=self._openai_model, input=texts)
+        return [d.embedding for d in resp.data]
+
+    def embed_query(self, query: str) -> list[float]:
+        out = self.embed([query])
+        return out[0] if out else []
+
+
+# ------------------------------------------------------------------
+# 中文分词
+# ------------------------------------------------------------------
+_PUNCT_RE = re.compile(r"[\s，。！？、；：（）【】《》「」『』""''\.,!?;:\(\)\[\]<>\"'`~@#$%^&*\+\-\=/\\|]")
+
+
+def tokenize_chinese(text: str) -> list[str]:
+    """jieba 分词 + 2-gram 兜底，便于覆盖未登录词"""
+    if not text:
+        return []
+    text = text.lower()
+    tokens: list[str] = []
+    for seg in jieba.cut_for_search(text):
+        seg = seg.strip()
+        if not seg or _PUNCT_RE.fullmatch(seg):
+            continue
+        tokens.append(seg)
+    # 2-gram 中文兜底，提高同义/近义召回
+    chinese_only = re.sub(r"[^一-鿿]", "", text)
+    for i in range(len(chinese_only) - 1):
+        tokens.append(chinese_only[i:i + 2])
+    return tokens
+
+
+# ------------------------------------------------------------------
+# Retriever
+# ------------------------------------------------------------------
+class Retriever:
+    def __init__(
+        self,
         embedding_provider: EmbeddingProvider,
-        persist_dir: str = "../data/chroma_db",
-        vector_top_k: int = 8,
-        bm25_top_k: int = 8,
-        rerank_top_k: int = 5,
-        hybrid_weight_vector: float = 0.5,
-        hybrid_weight_bm25: float = 0.5,
+        persist_dir: str = "./chroma_db",
+        vector_top_k: int = 10,
+        bm25_top_k: int = 10,
+        rerank_top_k: int = 6,
+        rrf_k: int = 60,
     ):
         self.embedding_provider = embedding_provider
         self.vector_top_k = vector_top_k
         self.bm25_top_k = bm25_top_k
         self.rerank_top_k = rerank_top_k
-        self.hybrid_weight_vector = hybrid_weight_vector
-        self.hybrid_weight_bm25 = hybrid_weight_bm25
+        self.rrf_k = rrf_k
 
-        # ChromaDB
-        self.chroma_client = chromadb.PersistentClient(
-            path=persist_dir,
-            settings=ChromaSettings(anonymized_telemetry=False),
-        )
+        try:
+            self.chroma_client = chromadb.PersistentClient(
+                path=persist_dir,
+                settings=ChromaSettings(anonymized_telemetry=False),
+            )
+        except Exception as e:
+            logger.warning(f"ChromaDB 持久化失败，回退内存模式: {e}")
+            self.chroma_client = chromadb.EphemeralClient(
+                settings=ChromaSettings(anonymized_telemetry=False),
+            )
 
         self.collection = None
         self.chunks: list[Chunk] = []
         self.bm25: Optional[BM25Okapi] = None
-        self._chunk_texts: list[str] = []
+        self._chunk_by_id: dict[str, Chunk] = {}
         self._conversation_history: list[dict] = []
 
+    # ------------------------------------------------------------------
+    # 索引
+    # ------------------------------------------------------------------
     def index(self, chunks: list[Chunk]):
-        """建立索引"""
         self.chunks = chunks
-        self._chunk_texts = [c.content for c in chunks]
-        logger.info(f"开始索引 {len(chunks)} 个 chunks...")
+        self._chunk_by_id = {c.chunk_id: c for c in chunks}
+        logger.info(f"建立索引，{len(chunks)} 个 chunk")
 
-        # 1. Dense 索引 (ChromaDB)
-        collection_name = "contract_docs"
-        try:
-            self.chroma_client.delete_collection(collection_name)
-        except Exception:
-            pass
-
-        self.collection = self.chroma_client.create_collection(
-            name=collection_name,
-            metadata={"hnsw:space": "cosine"},
-        )
-
-        # 批量生成 embedding 并插入
-        batch_size = 50
-        for i in range(0, len(chunks), batch_size):
-            batch = chunks[i:i + batch_size]
-            texts = [c.content for c in batch]
-            embeddings = self.embedding_provider.embed(texts)
-            ids = [c.chunk_id for c in batch]
-            metadatas = [c.metadata for c in batch]
-
-            self.collection.add(
-                embeddings=embeddings,
-                documents=texts,
-                ids=ids,
-                metadatas=metadatas,
-            )
-            logger.info(f"  向量索引: {i + len(batch)}/{len(chunks)}")
-
-        # 2. Sparse 索引 (BM25)
-        tokenized = [self._tokenize(text) for text in self._chunk_texts]
+        # BM25
+        tokenized = [tokenize_chinese(c.content) for c in chunks]
         self.bm25 = BM25Okapi(tokenized)
-        logger.info(f"  BM25 索引完成")
+        logger.info("  BM25 索引完成")
 
-    def _tokenize(self, text: str) -> list[str]:
-        """中文分词（简易方式：按字符+标点分词）"""
-        import re
-        # 简易分词：按标点、空格切分，同时保留连续的中文字符
-        tokens = []
-        for word in re.findall(r'[一-鿿]+|[a-zA-Z0-9]+|[^\s]', text):
-            if len(word) > 4 and re.match(r'^[一-鿿]+$', word):
-                # 对长中文词做2-gram
-                for j in range(0, len(word) - 1):
-                    tokens.append(word[j:j + 2])
-            tokens.append(word)
-        return tokens
+        # Dense
+        if self.embedding_provider.disabled:
+            logger.warning("  Dense 检索已禁用（embedding 不可用）")
+            return
 
+        try:
+            try:
+                self.chroma_client.delete_collection("contract_docs")
+            except Exception:
+                pass
+            self.collection = self.chroma_client.create_collection(
+                name="contract_docs",
+                metadata={"hnsw:space": "cosine"},
+            )
+            batch = 32
+            for i in range(0, len(chunks), batch):
+                sub = chunks[i:i + batch]
+                texts = [c.content for c in sub]
+                embs = self.embedding_provider.embed(texts)
+                if not embs:
+                    raise RuntimeError("embedding 返回空")
+                self.collection.add(
+                    embeddings=embs,
+                    documents=texts,
+                    ids=[c.chunk_id for c in sub],
+                    metadatas=[self._sanitize_metadata(c.metadata) for c in sub],
+                )
+                logger.info(f"  Dense 索引: {min(i + batch, len(chunks))}/{len(chunks)}")
+        except Exception as e:
+            logger.warning(f"Dense 索引失败，回退纯 BM25: {e}")
+            self.collection = None
+
+    @staticmethod
+    def _sanitize_metadata(meta: dict) -> dict:
+        """ChromaDB 不接受 None / list / dict，转成基本类型"""
+        out = {}
+        for k, v in meta.items():
+            if v is None:
+                continue
+            if isinstance(v, (str, int, float, bool)):
+                out[k] = v
+            elif isinstance(v, list):
+                out[k] = ",".join(str(x) for x in v)
+            elif isinstance(v, dict):
+                continue  # 跳过嵌套
+            else:
+                out[k] = str(v)
+        return out
+
+    # ------------------------------------------------------------------
+    # 检索（RRF 融合）
+    # ------------------------------------------------------------------
     def search(
         self,
         query: str,
-        use_hybrid: bool = True,
+        top_k: Optional[int] = None,
         filter_section: Optional[str] = None,
+        filter_block_type: Optional[str] = None,
     ) -> list[dict]:
-        """混合检索"""
-        logger.info(f"检索: '{query}'")
+        top_k = top_k or self.rerank_top_k
 
-        # Dense retrieval
-        query_embedding = self.embedding_provider.embed_query(query)
-        dense_results = self.collection.query(
-            query_embeddings=[query_embedding],
-            n_results=self.vector_top_k,
-            include=["documents", "metadatas", "distances"],
-        )
+        dense_ranking = self._dense_search(query)
+        sparse_ranking = self._bm25_search(query)
 
-        # Sparse retrieval (BM25)
-        tokenized_query = self._tokenize(query)
-        bm25_scores = self.bm25.get_scores(tokenized_query)
-        bm25_top_indices = sorted(
-            range(len(bm25_scores)),
-            key=lambda i: bm25_scores[i],
-            reverse=True,
-        )[:self.bm25_top_k]
+        # RRF 融合
+        scores: dict[str, float] = {}
+        for rank, cid in enumerate(dense_ranking):
+            scores[cid] = scores.get(cid, 0.0) + 1.0 / (self.rrf_k + rank + 1)
+        for rank, cid in enumerate(sparse_ranking):
+            scores[cid] = scores.get(cid, 0.0) + 1.0 / (self.rrf_k + rank + 1)
 
-        # 融合结果
-        if use_hybrid:
-            return self._hybrid_fusion(
-                dense_results, bm25_top_indices, bm25_scores, filter_section
-            )
-        else:
-            return self._format_dense_results(dense_results, filter_section)
-
-    def _hybrid_fusion(
-        self,
-        dense_results: dict,
-        bm25_indices: list[int],
-        bm25_scores,
-        filter_section: Optional[str],
-    ) -> list[dict]:
-        """加权融合 dense + sparse 结果"""
-        # 归一化分数
-        max_bm25 = max(bm25_scores) if max(bm25_scores) > 0 else 1.0
-
-        # 构建融合分数
-        scores = {}
-
-        # Dense 分数（distance 越小越好，转换为 similarity）
-        for i, (doc_id, distance) in enumerate(zip(
-            dense_results["ids"][0],
-            dense_results["distances"][0],
-        )):
-            sim = 1.0 - distance  # cosine distance -> similarity
-            scores[doc_id] = scores.get(doc_id, 0) + self.hybrid_weight_vector * sim
-
-        # BM25 分数
-        for idx in bm25_indices:
-            chunk_id = self.chunks[idx].chunk_id
-            norm_score = bm25_scores[idx] / max_bm25
-            scores[chunk_id] = scores.get(chunk_id, 0) + self.hybrid_weight_bm25 * norm_score
-
-        # 排序
         ranked = sorted(scores.items(), key=lambda x: x[1], reverse=True)
+
         results = []
-
-        for chunk_id, score in ranked[:self.rerank_top_k]:
-            for chunk in self.chunks:
-                if chunk.chunk_id == chunk_id:
-                    if filter_section and filter_section not in chunk.metadata.get("section_path", ""):
-                        continue
-                    results.append({
-                        "chunk_id": chunk.chunk_id,
-                        "content": chunk.content,
-                        "metadata": chunk.metadata,
-                        "score": score,
-                    })
-                    break
-
+        for cid, score in ranked:
+            c = self._chunk_by_id.get(cid)
+            if c is None:
+                continue
+            if filter_section and filter_section not in c.metadata.get("section_path", ""):
+                continue
+            if filter_block_type and c.metadata.get("block_type") != filter_block_type:
+                continue
+            results.append({
+                "chunk_id": c.chunk_id,
+                "content": c.content,
+                "metadata": c.metadata,
+                "score": score,
+                "dense_rank": dense_ranking.index(cid) + 1 if cid in dense_ranking else None,
+                "sparse_rank": sparse_ranking.index(cid) + 1 if cid in sparse_ranking else None,
+            })
+            if len(results) >= top_k:
+                break
         return results
 
-    def _format_dense_results(self, dense_results: dict, filter_section: Optional[str]) -> list[dict]:
-        """格式化纯向量检索结果"""
-        results = []
-        for i, (doc_id, distance) in enumerate(zip(
-            dense_results["ids"][0],
-            dense_results["distances"][0],
-        )):
-            sim = 1.0 - distance
-            if filter_section:
-                meta = dense_results["metadatas"][0][i]
-                if filter_section not in meta.get("section_path", ""):
-                    continue
-            results.append({
-                "chunk_id": doc_id,
-                "content": dense_results["documents"][0][i],
-                "metadata": dense_results["metadatas"][0][i],
-                "score": sim,
-            })
-        return results[:self.rerank_top_k]
+    def _dense_search(self, query: str) -> list[str]:
+        if self.collection is None or self.embedding_provider.disabled:
+            return []
+        try:
+            qemb = self.embedding_provider.embed_query(query)
+            if not qemb:
+                return []
+            res = self.collection.query(
+                query_embeddings=[qemb],
+                n_results=self.vector_top_k,
+                include=["documents", "distances"],
+            )
+            return list(res["ids"][0]) if res and res.get("ids") else []
+        except Exception as e:
+            logger.warning(f"Dense 检索失败: {e}")
+            return []
 
-    def rerank(self, query: str, candidates: list[dict], llm_client=None) -> list[dict]:
-        """使用 LLM 对候选结果重排序
+    def _bm25_search(self, query: str) -> list[str]:
+        if self.bm25 is None:
+            return []
+        tokens = tokenize_chinese(query)
+        if not tokens:
+            return []
+        scores = self.bm25.get_scores(tokens)
+        # 仅返回有正分的
+        order = sorted(range(len(scores)), key=lambda i: scores[i], reverse=True)
+        out = []
+        for i in order:
+            if scores[i] <= 0:
+                break
+            out.append(self.chunks[i].chunk_id)
+            if len(out) >= self.bm25_top_k:
+                break
+        return out
 
-        如果 llm_client 为 None，跳过 rerank，直接按原始分数排序返回。
-        """
-        if not candidates or llm_client is None:
-            return sorted(candidates, key=lambda x: x.get("score", 0), reverse=True)
+    # ------------------------------------------------------------------
+    # 证据回链
+    # ------------------------------------------------------------------
+    def locate_evidence(self, quote: str, top_n: int = 1) -> list[dict]:
+        """把任意一段文字（来自 LLM 的引用）反查到最相似的 chunk。
+        组合策略：子串精确匹配优先，否则用 BM25 排序。"""
+        if not quote or not self.chunks:
+            return []
+        quote = quote.strip()
 
-        if len(candidates) <= 2:
+        # 1) 精确子串匹配（去除空白）
+        normalized = re.sub(r"\s+", "", quote)
+        for c in self.chunks:
+            if normalized and normalized in re.sub(r"\s+", "", c.content):
+                return [self._format_evidence(c, match_type="exact_substring", quote=quote)]
+
+        # 2) BM25 粗排
+        ranked_ids = self._bm25_search(quote)
+        out = []
+        for cid in ranked_ids[:top_n]:
+            c = self._chunk_by_id.get(cid)
+            if c:
+                out.append(self._format_evidence(c, match_type="bm25", quote=quote))
+        return out
+
+    def _format_evidence(self, chunk: Chunk, match_type: str, quote: str) -> dict:
+        meta = chunk.metadata
+        return {
+            "chunk_id": chunk.chunk_id,
+            "section": meta.get("section_path", "") or "(未知章节)",
+            "page_hint": meta.get("page_hint"),
+            "pages": meta.get("pages"),
+            "block_type": meta.get("block_type"),
+            "table_id": meta.get("table_id"),
+            "match_type": match_type,
+            "matched_quote": quote,
+            "snippet": chunk.content[:200],
+        }
+
+    # ------------------------------------------------------------------
+    # LLM rerank
+    # ------------------------------------------------------------------
+    def rerank(self, query: str, candidates: list[dict], llm_client=None, model: Optional[str] = None) -> list[dict]:
+        if not candidates or len(candidates) <= 2 or llm_client is None:
             return candidates
 
-        # 构建 rerank prompt
-        candidates_text = ""
+        body = ""
         for i, c in enumerate(candidates):
-            candidates_text += f"\n--- 文档片段 {i + 1} ---\n"
-            candidates_text += f"来源: {c['metadata'].get('section_path', '未知')}\n"
-            candidates_text += f"内容: {c['content'][:500]}\n"
+            sec = c["metadata"].get("section_path", "")
+            body += f"\n[{i + 1}] 章节: {sec}\n{c['content'][:400]}\n"
 
-        prompt = f"""请评估以下文档片段与查询问题的相关性，按相关性从高到低排序，返回排序后的编号列表。
+        prompt = f"""你是一个相关性评分助手。给定一个问题和若干候选片段，请按相关性从高到低排序。
 
-查询问题: {query}
+问题：{query}
 
-{candidates_text}
+候选：{body}
 
-请只输出排序后的编号（如: 3, 1, 5, 2, 4），不要输出其他内容。"""
-
+只输出编号序列，逗号分隔，例如：3,1,5,2,4。不要其他内容。"""
         try:
-            from anthropic import Anthropic
-            client = Anthropic(api_key=os.environ.get("ANTHROPIC_API_KEY"))
-            message = client.messages.create(
-                model=os.environ.get("ANTHROPIC_MODEL", "claude-sonnet-4-6"),
-                max_tokens=100,
+            resp = llm_client.messages.create(
+                model=model or os.environ.get("ANTHROPIC_MODEL", "claude-sonnet-4-6"),
+                max_tokens=120,
                 messages=[{"role": "user", "content": prompt}],
             )
-            response = message.content[0].text.strip()
-
-            # 解析排序结果
-            order = []
-            for part in response.split(','):
-                try:
-                    order.append(int(part.strip()) - 1)
-                except ValueError:
-                    pass
-
-            reranked = [candidates[i] for i in order if 0 <= i < len(candidates)]
-            return reranked if reranked else candidates
+            text = resp.content[0].text.strip()
+            order_idx = []
+            for tok in re.split(r"[,\s，]+", text):
+                if tok.isdigit():
+                    j = int(tok) - 1
+                    if 0 <= j < len(candidates):
+                        order_idx.append(j)
+            seen = set()
+            ordered = []
+            for j in order_idx:
+                if j not in seen:
+                    ordered.append(candidates[j])
+                    seen.add(j)
+            for j, c in enumerate(candidates):
+                if j not in seen:
+                    ordered.append(c)
+            return ordered
         except Exception as e:
-            logger.warning(f"Rerank 失败，使用原始排序: {e}")
-            return sorted(candidates, key=lambda x: x.get("score", 0), reverse=True)
+            logger.warning(f"Rerank 失败: {e}")
+            return candidates
 
-    # ---- 多轮问答支持 ----
-
+    # ------------------------------------------------------------------
+    # 多轮支持
+    # ------------------------------------------------------------------
     def reset_conversation(self):
-        """重置对话历史"""
         self._conversation_history = []
 
     def add_to_history(self, role: str, content: str):
-        """添加对话记录"""
         self._conversation_history.append({"role": role, "content": content})
 
-    def rewrite_query(self, current_query: str, llm_client=None) -> str:
-        """多轮问题改写 — 消解指代、补全上下文"""
-        if not self._conversation_history:
+    @property
+    def conversation_history(self) -> list[dict]:
+        return self._conversation_history
+
+    def rewrite_query(self, current_query: str, llm_client=None, model: Optional[str] = None) -> str:
+        if not self._conversation_history or llm_client is None:
             return current_query
+        history = ""
+        for h in self._conversation_history[-6:]:
+            history += f"\n{h['role']}: {h['content'][:500]}"
 
-        history_text = ""
-        for h in self._conversation_history[-4:]:  # 最近 4 轮
-            history_text += f"\n{h['role']}: {h['content']}"
+        prompt = f"""你是一个对话改写器。给定一段对话历史和最新一句追问，将追问改写为一个独立、自包含的问题。
 
-        prompt = f"""以下是一段对话历史，然后是一个追问。请将追问改写为一个独立的、不需要依赖对话上下文就能理解的完整问题。
+对话历史:{history}
 
-对话历史:{history_text}
-
-追问: {current_query}
+最新追问: {current_query}
 
 要求：
-1. 将指代词（"这些"、"它们"、"上述"等）替换为具体对象
-2. 补全省略的主语、宾语
-3. 保持原意不变
+1. 把"这些/它们/上述/这个"等指代词替换为前文中出现的具体名词
+2. 补全省略的主语/宾语
+3. 保留前文已识别出的关键实体名称（如系统模块名、合同条款编号、金额等），便于检索
+4. 保持原意和语气
 
-请只输出改写后的问题，不要加引号或其他标记。"""
-
+只输出改写后的问题，不加引号。"""
         try:
-            from anthropic import Anthropic
-            client = Anthropic(api_key=os.environ.get("ANTHROPIC_API_KEY"))
-            message = client.messages.create(
-                model=os.environ.get("ANTHROPIC_MODEL", "claude-sonnet-4-6"),
-                max_tokens=200,
+            resp = llm_client.messages.create(
+                model=model or os.environ.get("ANTHROPIC_MODEL", "claude-sonnet-4-6"),
+                max_tokens=300,
                 messages=[{"role": "user", "content": prompt}],
             )
-            rewritten = message.content[0].text.strip()
-            logger.info(f"问题改写: '{current_query}' -> '{rewritten}'")
-            return rewritten
+            rewritten = resp.content[0].text.strip().strip('"').strip("'")
+            logger.info(f"问题改写: {current_query!r} -> {rewritten!r}")
+            return rewritten or current_query
         except Exception as e:
-            logger.warning(f"问题改写失败，使用原问题: {e}")
+            logger.warning(f"问题改写失败: {e}")
             return current_query

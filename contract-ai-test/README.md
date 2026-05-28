@@ -1,145 +1,172 @@
 # 合同 AI 审查与知识库检索
 
-基于"智能印章与合同审查平台建设项目"综合测试文档的 RAG 问答与合同审查系统。
+基于"智能印章与合同审查平台建设项目"综合测试 PDF（52 页扫描件）的 RAG 问答与合同审查系统。
 
-## 项目概述
+## 1. 能力概览
 
-本项目实现了两个核心能力：
+- **RAG 问答**：扫描件 PDF → 结构化文本 → 分块索引 → 三类问答（简单/多轮/复杂推理），全部回链到原文 chunk
+- **合同审查**：10 个审查维度分别定向检索 + 独立 LLM 调用，证据回链到真实 `chunk_id`，severity ∈ {low, medium, high}
+- **可复现**：单页 OCR 缓存 + 中间产物（parsed_document.json / chunks.json / chroma_db）全部落盘
+- **降级路径**：本地 Embedding（默认）/ ChromaDB 内存模式 / 解析失败标记 needs_review
 
-1. **RAG 问答**：将 PDF 合同文档处理为可检索的知识库，支持简单事实查询、多轮对话和跨文档复杂推理。
-2. **合同审查**：自动识别合同中的潜在风险，输出结构化审查结果（至少 6 条，含证据和建议）。
-
-## 目录结构
+## 2. 目录结构
 
 ```
 contract-ai-test/
-  README.md                       # 本文件
-  .env.example                    # 环境变量配置示例
-  requirements.txt                # Python 依赖
-  src/                            # 源码
-    __init__.py
-    main.py                       # 主入口
-    pdf_parser.py                 # PDF 解析 (OCR/视觉模型)
-    chunker.py                    # 文档分块
-    retriever.py                  # 检索 (向量+BM25+Rerank)
-    qa_engine.py                  # RAG 问答引擎
-    review_engine.py              # 合同审查引擎
-  outputs/                        # 输出文件
-    qa_results.json               # RAG 问答结果
-    review_results.json           # 合同审查结果
-  docs/                           # 文档
-    chunking_and_retrieval.md     # 分块与检索策略说明
-    bad_cases.md                  # 失败案例分析 (>= 3 个)
-  data/                           # 数据
-    AI知识库-综合测试文档.pdf      # 测试 PDF (自行放入)
+├── README.md                  本文件
+├── .env.example               环境变量模板（.env 已 gitignore）
+├── requirements.txt
+├── run.sh / run.bat           Linux-macOS / Windows 启动脚本
+├── src/
+│   ├── main.py                主流程
+│   ├── pdf_parser.py          扫描件解析（Vision OCR + 缓存 + 跨页表格合并）
+│   ├── chunker.py             分块（block 分组 + 递归切分 + overlap）
+│   ├── retriever.py           检索（jieba+2gram BM25 + Chroma dense + RRF + locate_evidence）
+│   ├── qa_engine.py           QA（结构化引用 + 多轮改写 + Q3 conflicts 输出）
+│   └── review_engine.py       审查（10 维度定向检索 + 证据回链）
+├── data/
+│   └── AI知识库-综合测试文档.pdf
+├── outputs/                   运行产物（gitignore）
+│   ├── parsed_document.json
+│   ├── chunks.json
+│   ├── full_text.txt
+│   ├── qa_results.json        ← 必交
+│   ├── review_results.json    ← 必交
+│   ├── chroma_db/
+│   └── .ocr_cache/            单页 OCR 缓存，重跑零成本
+└── docs/
+    ├── chunking_and_retrieval.md   ← 必交
+    └── bad_cases.md                ← 必交
 ```
 
-## 环境要求
+## 3. 环境要求
 
-- Python 3.11+
-- 以下 API Key 之一:
-  - **Anthropic API Key**（必需 — 用于 OCR 文本提取、问答、审查）
-  - **OpenAI API Key**（可选 — 用于 Embedding，也可使用本地模型替代）
+- Python 3.9+
+- LLM 后端二选一：
+  - **AWS Bedrock**（推荐 — 用 IAM 凭证，无需 API key），region 需开启 `claude-sonnet-4-6` 或同类 inference profile
+  - **Anthropic 官方 API**（设置 `ANTHROPIC_API_KEY`）
+- OpenAI API Key（**可选** — 默认使用本地 SentenceTransformer 做 embedding）
 
-## 快速开始
-
-### 1. 安装依赖
-
-```bash
-pip install -r requirements.txt
-```
-
-### 2. 配置环境变量
+## 4. 快速开始
 
 ```bash
+# 1. 安装依赖
+python3 -m pip install -r requirements.txt
+
+# 2. 配置环境变量
 cp .env.example .env
-# 编辑 .env，填入你的 API Key
+# Bedrock 用户：保持 USE_BEDROCK=true，根据机器实际 region 调整 BEDROCK_REGION
+# Anthropic 直连用户：把 USE_BEDROCK 改为 false，并填 ANTHROPIC_API_KEY
+
+# 3. 把 PDF 放到 data/ 目录（题目自带，已就位）
+
+# 4. 一键运行
+./run.sh                     # Linux/macOS
+run.bat                      # Windows
 ```
 
-### 3. 准备 PDF
+首次运行会逐页调用 Claude Vision OCR（52 页约 3~5 分钟，~50K-150K tokens）。
+所有单页 OCR 结果会缓存到 `outputs/.ocr_cache/`，**重跑零成本**。
 
-将 `【玄武纪】综合测试文档.pdf` 放入 `data/` 目录。
-
-### 4. 运行
-
+跳过 OCR 直接用上次解析结果：
 ```bash
-cd src
-python main.py --pdf ../data/AI知识库-综合测试文档.pdf --output-dir ../outputs
+python3 src/main.py --pdf data/AI知识库-综合测试文档.pdf --skip-ocr
 ```
 
-### 5. 查看结果
-
-- `outputs/qa_results.json` — 三类问答结果
-- `outputs/review_results.json` — 合同审查风险列表
-- `outputs/parsed_document.json` — 解析后的结构化文档
-- `outputs/chunks.json` — 分块结果
-
-## 命令行参数
-
-| 参数 | 说明 | 默认值 |
-|---|---|---|
-| `--pdf` | PDF 文件路径（必需） | - |
-| `--output-dir` | 输出目录 | `../outputs` |
-| `--skip-ocr` | 跳过 OCR，使用已保存的解析结果 | `false` |
-| `--parsed-json` | 已解析文档 JSON 路径 | - |
-| `--api-key` | Anthropic API Key | 环境变量 `ANTHROPIC_API_KEY` |
-| `--model` | Claude 模型名称 | `claude-sonnet-4-6` |
-
-## 主要流程
-
-```
-PDF (扫描件)
-  ↓ PyMuPDF 渲染为图像 (300 DPI)
-  ↓ Claude Vision API 逐页提取结构化文本
-  ↓ 解析为 TextBlock (标题/段落/表格/图示/签署)
-  ↓ 分块 (按节合并段落, 表格独立, 递归切分长文本)
-  ↓ 索引 (ChromaDB 向量 + BM25 关键词)
-  ↓ 检索 (Hybrid + LLM Rerank)
-  ↓ ├─ RAG 问答 (Q1简单/Q2多轮/Q3复杂推理)
-  ↓ └─ 合同审查 (10 维度定向检索 + LLM 审查)
-  ↓ 输出 JSON 结果
+只跑 QA 不跑审查（或反之）：
+```bash
+python3 src/main.py --skip-ocr --no-review
+python3 src/main.py --skip-ocr --no-qa
 ```
 
-## 检索策略概要
+调试用，仅处理前 3 页：
+```bash
+python3 src/main.py --max-pages 3
+```
 
-- **Embedding**: OpenAI `text-embedding-3-small` 或本地 `all-MiniLM-L6-v2`
-- **向量库**: ChromaDB (Cosine Similarity)
-- **关键词**: BM25 (rank_bm25)
-- **融合**: 加权求和 (vector 0.5 + BM25 0.5)
-- **Rerank**: LLM-based
-- **多轮**: LLM 问题改写 + 对话历史维护
+## 5. 主要流程
+
+```
+PDF (52 页扫描件)
+  │
+  ├─ Step 1 PyMuPDF 渲染 300 DPI → Claude Vision OCR
+  │  ├─ 标记标题/段落/表格/图示/签署区
+  │  ├─ 跨页表格自动合并（表头继承）
+  │  └─ 单页缓存 → outputs/.ocr_cache/
+  │
+  ├─ Step 2 分块
+  │  ├─ 按 block_type 分组（table/figure/signature 独立成块）
+  │  ├─ 同 section_path 段落合并到 ≤1000 字符
+  │  └─ 长段落按句号边界递归切分 + 120 字 overlap
+  │
+  ├─ Step 3 索引
+  │  ├─ Dense  : ChromaDB + 本地 SentenceTransformer / OpenAI
+  │  └─ Sparse : BM25 + jieba 分词 + 中文 2-gram 兜底
+  │
+  ├─ Step 4 RAG 问答
+  │  ├─ Q1 simple      : hybrid (RRF) + LLM rerank → 结构化 JSON 答案
+  │  ├─ Q2 multi_turn  : 第 2 轮起 LLM 改写指代 → 重新检索；维护历史
+  │  └─ Q3 complex     : 子问题分解 → 多路检索合并 → 输出 conflicts[]
+  │                       每条标 fact / inference / human_review
+  │
+  └─ Step 5 合同审查（10 维度定向）
+     1. 主体一致性          6. 附件完整性
+     2. 金额一致性          7. 违约责任对等性
+     3. 付款 vs 验收/交付   8. 数据安全/私有化部署
+     4. 交付计划一致性      9. 流程图与正文一致性
+     5. 验收标准明确性     10. OCR 不确定项（needs_review chunks）
+     ↓
+     每维度独立检索 + 独立 LLM 调用 → 证据用 retriever.locate_evidence 回链 → 去重
+```
+
+## 6. 检索策略要点
+
+- **Hybrid Search (RRF)**：dense rank + sparse rank 用 `1/(60 + rank)` 累加，无需手动调权
+- **中文分词**：`jieba.cut_for_search` + 2-gram 字符级兜底，覆盖法律术语未登录词
+- **证据回链**：LLM 输出引用时给出 `chunk_id` + `quote`；后处理用 `chunk_id` 取真实元数据，`chunk_id` 错误则用 `quote` 子串/BM25 兜底反查
+- **多轮改写**：保留前轮回答中的关键实体名称（系统模块名、付款节点编号等），不丢失检索锚点
 
 详见 [`docs/chunking_and_retrieval.md`](docs/chunking_and_retrieval.md)。
 
-## 限制与已知问题
+## 7. 输出文件契约
 
-1. **API 依赖**: PDF OCR 依赖 Claude Vision API，每页约 1-2 秒，20 页约 20-40 秒
-2. **API 成本**: 每页 OCR 约消耗 ~2000-4000 tokens（图像），整个流程约 50K-100K tokens
-3. **OCR 精度**: 扫描件质量直接影响提取准确率，低质量页面会进入人工复核
-4. **表格处理**: 复杂嵌套表格可能提取不完整
-5. **本地运行**: 如果无法访问 API，系统无法完成 OCR 和问答（文本替换为本地 OCR 方案需额外配置 Tesseract）
-6. **嵌入模型**: 通用 embedding 模型对中文法律术语的语义理解有限
+### `outputs/qa_results.json`
+- Q1 一条记录：`{question_id:"Q1", question_type:"simple", answer, citations[], retrieval_notes, confidence}`
+- Q2 三条：`question_id:"Q2-1/2/3"`，含 `rewritten_question`、`turn`
+- Q3 一条：额外字段 `conflicts[]`，每条 conflict 含 `conclusion_class ∈ {fact, inference, human_review}`
 
-## 如果评审人员无法完全复现
+### `outputs/review_results.json`
+- 数组，每条：`{risk_id, risk_type, severity, title, evidence[], reason, suggestion, needs_human_review, confidence}`
+- `evidence[i]` 含 `source_id` (真实 chunk_id) / `section` / `page_hint` / `pages` / `block_type` / `table_id` / `quote`
+- `severity == "high"` 自动设 `needs_human_review = true`
 
-本项目依赖以下外部服务，如果因网络或账号限制无法访问：
+## 8. 限制与已知问题
 
-1. **Anthropic API**: 可替换为其他兼容 API（OpenAI、本地模型等）
-2. **OpenAI API**: Embedding 可切换为本地模型（设置 `USE_LOCAL_EMBEDDINGS=true`）
-3. **ChromaDB**: 会自动降级为内存模式
+1. **API 依赖**：扫描件无法本地 OCR（题目要求"扫描件材料"），首跑必须有 Anthropic API。已用 per-page 缓存把"重跑成本"压到零
+2. **Vision 单页 token 上限**：max_tokens=8192；极少数信息密度高的页面可能仍被截断 → 标记需人工复核
+3. **印章/水印**：Vision prompt 已要求忽略水印；印章覆盖区域用 `[?]` 占位，自动进入 `needs_review`
+4. **跨页表格**：相同 section_path + 相邻页 + 表头一致才合并；不一致时退化为多个独立表格 chunk
+5. **本地 embedding 中文表达力**：默认 `all-MiniLM-L6-v2` 对中文法律术语支持有限，BM25 + 2-gram 是主力召回手段
+6. **LLM 输出格式**：尽量要求结构化 JSON；解析失败兜底走 quote 反查 → 几乎不会出现"无引用"的情况
 
-所有中间结果（解析后的 JSON、chunks、检索片段）都会保存到 `outputs/` 目录，评审人员可以直接查看。
+## 9. 评审无法复现时的应对
 
-## 扩展性
+- **没有 Anthropic key**：无法做 OCR / QA / 审查；可仅检查 `outputs/parsed_document.json` 与 `outputs/chunks.json`（如已附带）
+- **没有 OpenAI key**：默认就是本地 embedding，不受影响
+- **网络受限装不了 sentence-transformers**：retriever 会自动降级为纯 BM25，仍可工作
 
-系统设计支持扩展到 200+ 页文档：
-- 章节级路由 + 子索引
-- 层次化检索（章节→段落→句子）
-- 摘要层加速
-- 查询规划和分解
+## 10. 与题目要求的对应
 
-详见 `docs/chunking_and_retrieval.md` 第 6 节。
-
-## License
-
-本项目仅用于笔试评估目的。
+| 题目要求 | 实现位置 |
+|---|---|
+| qa_results.json 含 citations / retrieval_notes / confidence | `qa_engine.py` 输出契约 + `outputs/qa_results.json` |
+| 引用能定位章节/表格/图示/附件 | chunk metadata: `section_path / table_id / block_type / page_hint` |
+| review_results.json severity ∈ low/medium/high + 原文证据 | `review_engine.py` + 证据回链 |
+| 不"一次性把全文塞给大模型" | 分维度定向检索；每维度独立 prompt |
+| 多轮改写 + 上下文指代 | `retriever.rewrite_query` + 历史进 prompt |
+| 复杂推理区分 fact / inference / human_review | Q3 输出 `conflicts[].conclusion_class` |
+| 表格/图示/签署独立处理 | parser block_type + chunker 分组 |
+| OCR 不确定项进入人工复核 | `[?]` 占位 + needs_review 维度 |
+| 至少 6 条风险 | 10 维度，单维度多条 |
+| 至少 3 个 bad case | `docs/bad_cases.md` 5 个 |
+| .env.example 不含真实 key | `.env.example` 占位 + `.gitignore` 屏蔽 .env |

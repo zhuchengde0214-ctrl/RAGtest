@@ -1,13 +1,13 @@
 """
-主运行脚本 — 合同 AI 审查与知识库检索
+主入口
 
 流程：
-1. PDF 解析（OCR/视觉模型提取文本）
-2. 文档分块 + 元数据标注
-3. 建立索引（向量 + BM25）
-4. RAG 问答（Q1 简单 / Q2 多轮 / Q3 复杂推理）
-5. 合同审查（风险识别）
-6. 输出结果文件
+1. PDF 解析（带 per-page 缓存）
+2. 文档分块 + 元数据
+3. 建索引（dense + sparse）
+4. RAG 问答（Q1 / Q2 / Q3）
+5. 合同审查（10 维度定向检索）
+6. 输出 outputs/qa_results.json + outputs/review_results.json
 """
 
 import argparse
@@ -16,12 +16,11 @@ import logging
 import os
 import sys
 from pathlib import Path
-from typing import Optional
 
-# 确保 src 目录在 sys.path 中
-_src_dir = os.path.dirname(os.path.abspath(__file__))
-if _src_dir not in sys.path:
-    sys.path.insert(0, _src_dir)
+# sys.path
+_HERE = os.path.dirname(os.path.abspath(__file__))
+if _HERE not in sys.path:
+    sys.path.insert(0, _HERE)
 
 from dotenv import load_dotenv
 
@@ -30,158 +29,135 @@ from chunker import DocumentChunker
 from retriever import EmbeddingProvider, Retriever
 from qa_engine import QAEngine
 from review_engine import ReviewEngine
+from llm_client import get_default_model
 
-# 加载 .env
 load_dotenv()
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
-logger = logging.getLogger(__name__)
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    datefmt="%H:%M:%S",
+)
+logger = logging.getLogger("main")
 
-# ============================================================
-# 问题定义
-# ============================================================
 
-Q1_QUESTION = "本项目包含哪些主要系统模块？请列出模块名称，并说明每个模块的主要用途。"
-
-Q2_QUESTIONS = [
+# ---------- 题目 3 类问题 ----------
+Q1 = "本项目包含哪些主要系统模块？请列出模块名称，并说明每个模块的主要用途。"
+Q2 = [
     "本项目需要交付哪些主要成果物？",
     "这些成果物分别对应哪些验收材料？",
     "如果验收材料缺失，可能影响哪些付款节点？请说明依据。",
 ]
+Q3 = "请综合判断本项目的付款安排、验收条件、交付计划和附件说明之间是否存在冲突或不一致。请逐条说明依据，并指出哪些问题需要人工复核。"
 
-Q3_QUESTION = "请综合判断本项目的付款安排、验收条件、交付计划和附件说明之间是否存在冲突或不一致。请逐条说明依据，并指出哪些问题需要人工复核。"
+
+def parse_args():
+    p = argparse.ArgumentParser(description="合同 AI 审查与知识库检索")
+    p.add_argument("--pdf", type=str, default=os.environ.get("PDF_PATH", "data/AI知识库-综合测试文档.pdf"))
+    p.add_argument("--output-dir", type=str, default=os.environ.get("OUTPUT_DIR", "outputs"))
+    p.add_argument("--cache-dir", type=str, default=None, help="OCR 单页缓存目录，默认 outputs/.ocr_cache")
+    p.add_argument("--skip-ocr", action="store_true", help="跳过 OCR，使用已保存的 parsed_document.json")
+    p.add_argument("--parsed-json", type=str, default=None)
+    p.add_argument("--max-pages", type=int, default=None, help="只处理前 N 页（调试用）")
+    p.add_argument("--api-key", type=str, default=None)
+    p.add_argument("--model", type=str, default=None)
+    p.add_argument("--no-qa", action="store_true", help="跳过 QA 阶段")
+    p.add_argument("--no-review", action="store_true", help="跳过审查阶段")
+    return p.parse_args()
 
 
 def main():
-    parser = argparse.ArgumentParser(description="合同 AI 审查与知识库检索")
-    parser.add_argument("--pdf", type=str, required=True, help="PDF 文件路径")
-    parser.add_argument("--output-dir", type=str, default="../outputs", help="输出目录")
-    parser.add_argument("--skip-ocr", action="store_true", help="跳过 OCR，使用已保存的解析结果")
-    parser.add_argument("--parsed-json", type=str, default=None, help="已解析文档 JSON 路径")
-    parser.add_argument("--api-key", type=str, default=None, help="Anthropic API Key")
-    parser.add_argument("--model", type=str, default=None, help="Claude 模型名称")
-    args = parser.parse_args()
+    args = parse_args()
 
+    use_bedrock = os.environ.get("USE_BEDROCK", "false").lower() in ("1", "true", "yes")
     api_key = args.api_key or os.environ.get("ANTHROPIC_API_KEY")
-    model = args.model or os.environ.get("ANTHROPIC_MODEL", "claude-sonnet-4-6")
+    model = args.model or get_default_model()
 
-    if not api_key:
-        logger.error("请设置 ANTHROPIC_API_KEY 环境变量或通过 --api-key 参数提供")
-        sys.exit(1)
+    if not use_bedrock:
+        if not api_key or api_key.startswith("sk-ant-xxxx"):
+            logger.error("请在 .env 配置真实的 ANTHROPIC_API_KEY，或设 USE_BEDROCK=true 使用 AWS Bedrock")
+            sys.exit(1)
 
-    output_dir = Path(args.output_dir)
+    output_dir = Path(args.output_dir).resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
+    cache_dir = Path(args.cache_dir).resolve() if args.cache_dir else output_dir / ".ocr_cache"
 
     logger.info("=" * 60)
-    logger.info("合同 AI 审查与知识库检索 — 开始运行")
-    logger.info(f"模型: {model}")
-    logger.info(f"输出目录: {output_dir}")
+    logger.info("合同 AI — 启动")
+    logger.info(f"  backend    : {'AWS Bedrock' if use_bedrock else 'Anthropic API'}")
+    logger.info(f"  PDF        : {args.pdf}")
+    logger.info(f"  output     : {output_dir}")
+    logger.info(f"  cache      : {cache_dir}")
+    logger.info(f"  model      : {model}")
     logger.info("=" * 60)
 
-    # ============================================================
-    # Step 1: PDF 解析
-    # ============================================================
+    # ---------- Step 1: 解析 ----------
     if args.skip_ocr and args.parsed_json:
-        logger.info("Step 1: 加载已保存的解析文档")
-        parsed_doc = load_parsed_document(args.parsed_json)
+        logger.info("[Step 1] 加载已保存的 parsed_document.json")
+        parsed = load_parsed_document(args.parsed_json)
+    elif args.skip_ocr and (output_dir / "parsed_document.json").exists():
+        path = output_dir / "parsed_document.json"
+        logger.info(f"[Step 1] 加载已保存的解析文档: {path}")
+        parsed = load_parsed_document(str(path))
     else:
-        logger.info("Step 1: PDF OCR 解析")
-        pdf_parser = PDFParser(api_key=api_key, model=model)
-        parsed_doc = pdf_parser.parse(args.pdf)
+        logger.info("[Step 1] PDF 解析（OCR + 缓存）")
+        pdf_parser = PDFParser(api_key=api_key, model=model, cache_dir=str(cache_dir))
+        parsed = pdf_parser.parse(args.pdf, max_pages=args.max_pages)
+        pdf_parser.save_parsed_document(parsed, str(output_dir / "parsed_document.json"))
 
-        # 保存解析结果
-        parsed_json_path = output_dir / "parsed_document.json"
-        pdf_parser.save_parsed_document(parsed_doc, str(parsed_json_path))
+    # 全文 dump（便于评审查阅）
+    (output_dir / "full_text.txt").write_text(parsed.raw_text, encoding="utf-8")
 
-    # 保存完整文本
-    full_text_path = output_dir / "full_text.txt"
-    with open(full_text_path, 'w', encoding='utf-8') as f:
-        f.write(parsed_doc.raw_text)
-    logger.info(f"完整文本已保存至: {full_text_path}")
-
-    # ============================================================
-    # Step 2: 文档分块
-    # ============================================================
-    logger.info("Step 2: 文档分块")
+    # ---------- Step 2: 分块 ----------
+    logger.info("[Step 2] 分块")
     chunker = DocumentChunker()
-    chunks = chunker.chunk(parsed_doc)
+    chunks = chunker.chunk(parsed)
+    chunker.save_chunks(chunks, str(output_dir / "chunks.json"))
 
-    # 保存分块结果
-    chunks_json_path = output_dir / "chunks.json"
-    chunker.save_chunks(chunks, str(chunks_json_path))
-
-    # ============================================================
-    # Step 3: 建立索引
-    # ============================================================
-    logger.info("Step 3: 建立检索索引")
-
-    use_local = os.environ.get("USE_LOCAL_EMBEDDINGS", "false").lower() == "true"
-    embedding_provider = EmbeddingProvider(
+    # ---------- Step 3: 索引 ----------
+    logger.info("[Step 3] 建索引")
+    use_local = os.environ.get("USE_LOCAL_EMBEDDINGS", "true").lower() == "true"
+    embedding = EmbeddingProvider(
         use_local=use_local,
         openai_api_key=os.environ.get("OPENAI_API_KEY"),
         model=os.environ.get("OPENAI_EMBEDDING_MODEL", "text-embedding-3-small"),
+        local_model=os.environ.get("LOCAL_EMBEDDING_MODEL", "all-MiniLM-L6-v2"),
     )
-
     retriever = Retriever(
-        embedding_provider=embedding_provider,
+        embedding_provider=embedding,
         persist_dir=os.environ.get("CHROMA_PERSIST_DIR", str(output_dir / "chroma_db")),
-        vector_top_k=int(os.environ.get("VECTOR_TOP_K", "8")),
-        bm25_top_k=int(os.environ.get("BM25_TOP_K", "8")),
-        rerank_top_k=int(os.environ.get("RERANK_TOP_K", "5")),
-        hybrid_weight_vector=float(os.environ.get("HYBRID_WEIGHT_VECTOR", "0.5")),
-        hybrid_weight_bm25=float(os.environ.get("HYBRID_WEIGHT_BM25", "0.5")),
+        vector_top_k=int(os.environ.get("VECTOR_TOP_K", "10")),
+        bm25_top_k=int(os.environ.get("BM25_TOP_K", "10")),
+        rerank_top_k=int(os.environ.get("RERANK_TOP_K", "6")),
     )
     retriever.index(chunks)
 
-    # ============================================================
-    # Step 4: RAG 问答
-    # ============================================================
-    logger.info("Step 4: RAG 问答")
-    qa_engine = QAEngine(api_key=api_key, model=model)
+    # ---------- Step 4: QA ----------
+    if not args.no_qa:
+        logger.info("[Step 4] RAG 问答")
+        qa = QAEngine(api_key=api_key, model=model)
+        results = []
+        results.append(qa.answer_simple(Q1, retriever))
+        results.extend(qa.answer_multi_turn(Q2, retriever))
+        results.append(qa.answer_complex(Q3, retriever))
 
-    all_qa_results = []
+        qa_path = output_dir / "qa_results.json"
+        with open(qa_path, "w", encoding="utf-8") as f:
+            json.dump(results, f, ensure_ascii=False, indent=2)
+        logger.info(f"  → {qa_path}")
 
-    # Q1: 简单事实问题
-    logger.info("--- Q1: 简单事实问题 ---")
-    q1_result = qa_engine.answer_simple(Q1_QUESTION, retriever)
-    all_qa_results.append(q1_result)
+    # ---------- Step 5: 审查 ----------
+    if not args.no_review:
+        logger.info("[Step 5] 合同审查")
+        engine = ReviewEngine(api_key=api_key, model=model)
+        risks = engine.review(chunks, retriever)
+        review_path = output_dir / "review_results.json"
+        with open(review_path, "w", encoding="utf-8") as f:
+            json.dump(risks, f, ensure_ascii=False, indent=2)
+        logger.info(f"  → {review_path}")
 
-    # Q2: 多轮问答
-    logger.info("--- Q2: 多轮问答 ---")
-    q2_results = qa_engine.answer_multi_turn(Q2_QUESTIONS, retriever)
-    all_qa_results.extend(q2_results)
-
-    # Q3: 全文复杂推理
-    logger.info("--- Q3: 全文复杂推理 ---")
-    q3_result = qa_engine.answer_complex(Q3_QUESTION, retriever)
-    all_qa_results.append(q3_result)
-
-    # 保存 QA 结果
-    qa_results_path = output_dir / "qa_results.json"
-    with open(qa_results_path, 'w', encoding='utf-8') as f:
-        json.dump(all_qa_results, f, ensure_ascii=False, indent=2)
-    logger.info(f"QA 结果已保存至: {qa_results_path}")
-
-    # ============================================================
-    # Step 5: 合同审查
-    # ============================================================
-    logger.info("Step 5: 合同审查")
-    review_engine = ReviewEngine(api_key=api_key, model=model)
-    risks = review_engine.review(parsed_doc.raw_text, retriever=retriever)
-
-    # 保存审查结果
-    review_results_path = output_dir / "review_results.json"
-    with open(review_results_path, 'w', encoding='utf-8') as f:
-        json.dump(risks, f, ensure_ascii=False, indent=2)
-    logger.info(f"审查结果已保存至: {review_results_path}")
-
-    # ============================================================
-    # 完成
-    # ============================================================
     logger.info("=" * 60)
-    logger.info("全部任务完成！")
-    logger.info(f"QA 结果: {qa_results_path}")
-    logger.info(f"审查结果: {review_results_path}")
+    logger.info("全部完成")
     logger.info("=" * 60)
 
 

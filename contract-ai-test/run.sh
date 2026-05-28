@@ -1,26 +1,30 @@
-#!/bin/bash
-# 合同 AI 审查与知识库检索 — 运行脚本
-# 请先编辑 .env 文件，填入 ANTHROPIC_API_KEY
+#!/usr/bin/env bash
+# 合同 AI 审查与知识库检索 — Linux/macOS 运行脚本
 
-set -e
-SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+set -euo pipefail
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
 
-echo "========================================"
-echo "合同 AI 审查与知识库检索"
-echo "========================================"
-echo ""
-echo "确认 .env 中已配置 ANTHROPIC_API_KEY..."
-echo ""
+PYTHON_EXE="${PYTHON_EXE:-python3}"
 
-PYTHON_EXE="$SCRIPT_DIR/python-portable/python.exe"
-echo "Python: $PYTHON_EXE"
-echo ""
+echo "=============================================="
+echo "  合同 AI 审查与知识库检索"
+echo "=============================================="
+echo "Python  : $($PYTHON_EXE --version)"
+echo "Workdir : $SCRIPT_DIR"
+echo
 
-"$PYTHON_EXE" src/main.py --pdf "data/AI知识库-综合测试文档.pdf" --output-dir "outputs"
+if [ ! -f .env ]; then
+  echo "[警告] 未找到 .env，将复制 .env.example 作为模板，请编辑后再运行。"
+  cp .env.example .env
+  exit 1
+fi
 
-echo ""
-echo "========================================"
-echo "运行完成！"
-echo "结果文件在 outputs/ 目录中"
-echo "========================================"
+# 默认 PDF 路径，可被命令行参数覆盖
+DEFAULT_PDF="data/AI知识库-综合测试文档.pdf"
+
+if [ "$#" -gt 0 ]; then
+  exec "$PYTHON_EXE" src/main.py "$@"
+else
+  exec "$PYTHON_EXE" src/main.py --pdf "$DEFAULT_PDF" --output-dir "outputs"
+fi
