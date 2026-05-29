@@ -38,50 +38,133 @@ jieba.setLogLevel(logging.WARNING)
 # Embedding
 # ------------------------------------------------------------------
 class EmbeddingProvider:
-    """支持 OpenAI / 本地 sentence-transformers / 纯关键词降级"""
+    """Embedding 提供方，支持三种 backend，按优先级降级：
+
+    1. AWS Bedrock Cohere（推荐 — 多语种 + IAM 凭证）
+       USE_BEDROCK_EMBEDDING=true
+       BEDROCK_EMBEDDING_MODEL=cohere.embed-multilingual-v3（默认）
+    2. OpenAI text-embedding-*（USE_BEDROCK_EMBEDDING=false 且 OPENAI_API_KEY 有效）
+    3. 本地 sentence-transformers（USE_LOCAL_EMBEDDINGS=true）
+    4. 全部失败 → disabled=True，retriever 自动只走 BM25
+    """
+
+    BEDROCK_DEFAULT = "cohere.embed-multilingual-v3"
+    OPENAI_DEFAULT = "text-embedding-3-small"
+    LOCAL_DEFAULT = "all-MiniLM-L6-v2"
 
     def __init__(
         self,
+        use_bedrock: Optional[bool] = None,
         use_local: bool = False,
         openai_api_key: Optional[str] = None,
-        model: str = "text-embedding-3-small",
-        local_model: str = "all-MiniLM-L6-v2",
+        model: str = OPENAI_DEFAULT,
+        local_model: str = LOCAL_DEFAULT,
+        bedrock_model: Optional[str] = None,
+        bedrock_region: Optional[str] = None,
     ):
-        self.use_local = use_local
+        # 默认从环境读 USE_BEDROCK_EMBEDDING（若未显式传入）
+        if use_bedrock is None:
+            use_bedrock = os.environ.get("USE_BEDROCK_EMBEDDING", "false").lower() in ("1", "true", "yes")
+
         self.disabled = False
-        self.model_name = local_model if use_local else model
-        self._local = None
+        self.backend: str = "none"            # bedrock | openai | local | none
+        self.model_name: str = ""
+        self._bedrock_model = bedrock_model or os.environ.get(
+            "BEDROCK_EMBEDDING_MODEL", self.BEDROCK_DEFAULT
+        )
+        self._bedrock_region = (
+            bedrock_region
+            or os.environ.get("BEDROCK_REGION")
+            or os.environ.get("AWS_REGION")
+            or os.environ.get("AWS_DEFAULT_REGION")
+            or "us-east-1"
+        )
+        self._bedrock_client = None
         self._openai_key = openai_api_key or os.environ.get("OPENAI_API_KEY")
         self._openai_model = model
+        self._local = None
         self._local_model_name = local_model
 
+        # 1. 优先 Bedrock
+        if use_bedrock:
+            try:
+                import boto3
+                self._bedrock_client = boto3.client("bedrock-runtime", region_name=self._bedrock_region)
+                # 不立刻调用 invoke，留到 embed() 第一次调用时验证（节省启动时间）
+                self.backend = "bedrock"
+                self.model_name = self._bedrock_model
+                logger.info(f"Embedding backend: Bedrock {self._bedrock_model} (region={self._bedrock_region})")
+                return
+            except Exception as e:
+                logger.warning(f"Bedrock embedding 初始化失败：{e}，尝试下一级降级")
+
+        # 2. 本地 sentence-transformers
         if use_local:
             try:
                 from sentence_transformers import SentenceTransformer
                 logger.info(f"加载本地 Embedding 模型: {local_model}")
                 self._local = SentenceTransformer(local_model)
+                self.backend = "local"
+                self.model_name = local_model
+                return
             except Exception as e:
-                logger.warning(f"本地 Embedding 加载失败，将禁用 dense 检索: {e}")
-                self.disabled = True
-        else:
-            if not self._openai_key or self._openai_key.startswith("sk-xxxx"):
-                logger.warning("未检测到有效 OPENAI_API_KEY，dense 检索禁用")
-                self.disabled = True
+                logger.warning(f"本地 Embedding 加载失败：{e}，尝试 OpenAI")
 
+        # 3. OpenAI
+        if self._openai_key and not self._openai_key.startswith("sk-xxxx"):
+            self.backend = "openai"
+            self.model_name = self._openai_model
+            logger.info(f"Embedding backend: OpenAI {self._openai_model}")
+            return
+
+        # 4. 全部失败
+        logger.warning("没有可用的 embedding backend，dense 检索将被禁用")
+        self.disabled = True
+
+    # ------------------------------------------------------------------
     def embed(self, texts: list[str]) -> list[list[float]]:
-        if self.disabled:
+        if self.disabled or not texts:
             return []
-        if self.use_local:
-            return self._local.encode(texts, normalize_embeddings=True).tolist()
-        from openai import OpenAI
-        client = OpenAI(api_key=self._openai_key)
-        # OpenAI 单次最多 ~2048 个输入；这里 batch 已在外部控制
-        resp = client.embeddings.create(model=self._openai_model, input=texts)
-        return [d.embedding for d in resp.data]
+        try:
+            if self.backend == "bedrock":
+                return self._embed_bedrock(texts)
+            if self.backend == "local":
+                return self._local.encode(texts, normalize_embeddings=True).tolist()
+            if self.backend == "openai":
+                from openai import OpenAI
+                client = OpenAI(api_key=self._openai_key)
+                resp = client.embeddings.create(model=self._openai_model, input=texts)
+                return [d.embedding for d in resp.data]
+        except Exception as e:
+            logger.error(f"embed 失败（backend={self.backend}）：{e}")
+            self.disabled = True
+            return []
+        return []
 
     def embed_query(self, query: str) -> list[float]:
         out = self.embed([query])
         return out[0] if out else []
+
+    # ------------------------------------------------------------------
+    def _embed_bedrock(self, texts: list[str]) -> list[list[float]]:
+        """Bedrock Cohere embedding。input_type 区分文档（建索引）和查询。"""
+        import json as _json
+        # Cohere 单次最多 96 个 input，超过要分批
+        BATCH = 96
+        out: list[list[float]] = []
+        for i in range(0, len(texts), BATCH):
+            sub = texts[i:i + BATCH]
+            body = _json.dumps({
+                "texts": sub,
+                "input_type": "search_document",
+            })
+            resp = self._bedrock_client.invoke_model(
+                modelId=self._bedrock_model,
+                body=body,
+            )
+            data = _json.loads(resp["body"].read())
+            out.extend(data["embeddings"])
+        return out
 
 
 # ------------------------------------------------------------------

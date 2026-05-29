@@ -69,8 +69,10 @@ def build_pipeline():
     parsed = load_parsed_document(str(parsed_path))
     chunks = DocumentChunker().chunk(parsed)
 
+    use_bedrock_emb = os.environ.get("USE_BEDROCK_EMBEDDING", "").lower() in ("1", "true", "yes")
     use_local = os.environ.get("USE_LOCAL_EMBEDDINGS", "true").lower() == "true"
     embedding = EmbeddingProvider(
+        use_bedrock=use_bedrock_emb,
         use_local=use_local,
         openai_api_key=os.environ.get("OPENAI_API_KEY"),
         model=os.environ.get("OPENAI_EMBEDDING_MODEL", "text-embedding-3-small"),
