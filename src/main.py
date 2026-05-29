@@ -50,7 +50,9 @@ def parse_args():
     p.add_argument("--no-qa", action="store_true", help="跳过 QA agent")
     p.add_argument("--no-review", action="store_true", help="跳过审查 agent")
     p.add_argument("--request", type=str, default=None,
-                   help="自然语言需求（启用 PlannerAgent，阶段 3）")
+                   help="自然语言需求；提供后自动启用 PlannerAgent")
+    p.add_argument("--use-planner", action="store_true",
+                   help="即使没提供 --request 也启用 PlannerAgent")
     p.add_argument("--orchestrator", choices=["self", "langgraph"],
                    default="self",
                    help="self=自研编排器；langgraph=用 LangGraph StateGraph")
@@ -92,30 +94,33 @@ def main():
         cache_dir=str(cache_dir),
     )
 
-    plan = build_plan(args)
+    use_planner = bool(args.use_planner or (args.request and args.request.strip()))
+    plan = None if use_planner else build_plan(args)
 
     logger.info("=" * 60)
     logger.info("合同 AI Multi-Agent — 启动")
     logger.info(f"  backend       : {'AWS Bedrock' if use_bedrock else 'Anthropic API'}")
     logger.info(f"  model         : {get_default_model()}")
     logger.info(f"  orchestrator  : {args.orchestrator}")
+    logger.info(f"  use_planner   : {use_planner}")
+    if args.request:
+        logger.info(f"  request       : {args.request}")
     logger.info(f"  PDF           : {args.pdf}")
     if args.pdf_v2:
         logger.info(f"  PDF v2        : {args.pdf_v2}")
     logger.info(f"  output        : {output_dir}")
-    logger.info(f"  plan          : {plan}")
+    logger.info(f"  plan          : {plan if plan else '(由 PlannerAgent 决定)'}")
     logger.info("=" * 60)
 
     if args.orchestrator == "langgraph":
-        # 阶段 2 实现；如未实现则回退 self
         try:
             from agents.langgraph_orchestrator import LangGraphOrchestrator
-            orch = LangGraphOrchestrator(plan=plan)
+            orch = LangGraphOrchestrator(plan=plan, use_planner=use_planner)
         except ImportError:
             logger.warning("LangGraph 编排器未安装/未实现，回退到自研编排器")
-            orch = Orchestrator(plan=plan)
+            orch = Orchestrator(plan=plan, use_planner=use_planner)
     else:
-        orch = Orchestrator(plan=plan)
+        orch = Orchestrator(plan=plan, use_planner=use_planner)
 
     state = orch.run(state)
 

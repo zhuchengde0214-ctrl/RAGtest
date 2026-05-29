@@ -1,20 +1,47 @@
-# 合同 RAG 问答与风险审查系统
+# 合同 Multi-Agent 问答与风险审查系统
 
-> 基于扫描件 PDF 的端到端 RAG 流水线：**Vision OCR → 语义分块 → 混合检索 → 多轮问答 + 10 维度风险审查**。所有引用可定位到具体章节/页码/表格。
+> 基于扫描件 PDF 的多模态 + RAG 多 Agent 系统：
+> **Vision OCR → 语义分块 → 混合检索 → 多轮问答 / 10 维度风险审查 / 跨合同对比 / 自我反思重跑**。
+> LangGraph 编排 7 个独立 Agent，PlannerAgent 看用户需求自动决定执行计划。
 
 ![demo placeholder](docs/assets/demo.gif)
-*(完整运行截图见 `docs/assets/`，Web 界面见 §3)*
+*(完整运行截图见 `docs/assets/`，Web 界面见 §6)*
+
+---
+
+## 🧠 Agent 架构
+
+```mermaid
+graph TD
+    Start([START]) --> Planner["🧠 PlannerAgent<br/>LLM 决定执行计划"]
+    Planner -->|plan| Parser["📄 ParserAgent<br/>Vision OCR + 跨页表"]
+    Parser --> Indexer["🔍 IndexerAgent<br/>分块 + Chroma + BM25"]
+    Indexer -.->|qa| QA["💬 QAAgent<br/>Q1/Q2/Q3"]
+    Indexer -.->|audit| Audit["⚠️ AuditAgent<br/>10 维度风险审查"]
+    Indexer -.->|diff| Diff["🔀 DiffAgent<br/>v1 vs v2 条款对比"]
+    Audit --> Reflection["🪞 ReflectionAgent<br/>检查重复/冲突/遗漏"]
+    Reflection -.->|needs_rerun| Audit
+    Reflection --> End([END])
+    QA --> End
+    Diff --> End
+```
+
+7 个 Agent 各司其职 → SharedState 流转 → LangGraph 条件边路由（含 ReAct 循环）。
+完整图见 [`docs/agent_workflow.mmd`](docs/agent_workflow.mmd)，分层架构见 [`docs/architecture.md`](docs/architecture.md)。
 
 ---
 
 ## ✨ 亮点
 
-- **真做 RAG**，不是"全文塞 LLM"：合同审查按 10 个语义维度独立检索 + 独立调用，避免 Lost-in-the-Middle
+- **多 Agent 编排**：LangGraph StateGraph 编排 + 自研 BaseAgent 抽象，PlannerAgent 用 LLM 看 `user_request` 动态决定 plan，ReflectionAgent 触发 audit 重跑（ReAct 循环）
+- **多模态文档理解**：Claude Vision 直接读 PDF 扫描页，结构化标记 prompt 同时提取文字 / 表格 / 流程图 / 印章签署区
+- **跨合同条款级对比**：DiffAgent 章节对齐 + LLM 比对，自动识别 changed / added / removed / 章节增删，每条 diff 回链到 v1/v2 真实 chunk
+- **真做 RAG**：合同审查按 10 个语义维度独立检索 + 独立调用，避免 Lost-in-the-Middle
 - **引用可回链**：LLM 输出 `chunk_id + quote`，错误时用子串/BM25 反查到真实 chunk —— Citation Hit Rate 见 [`docs/evaluation.md`](docs/evaluation.md)
-- **中文检索增强**：`jieba` + 2-gram 字符级兜底，覆盖法律术语未登录词；BM25 + dense 用 RRF 融合
+- **中文检索增强**：`jieba` + 2-gram 字符级兜底，BM25 + dense 用 RRF 融合
 - **跨页表格合并**：报价表跨页时表头继承，避免数据行错位
 - **OCR 不确定项进入人工复核**：印章遮挡用 `[?]` 占位 → `needs_review=True` → 自动产出 medium 级风险
-- **JSON 输出鲁棒性**：自研 `_escape_inner_quotes` + `_repair_truncated_json`，处理 LLM 在中文字段嵌入未转义引号 / max_tokens 截断
+- **JSON 输出鲁棒性**：自研 `_escape_inner_quotes` + `_repair_truncated_json`，处理 LLM 中文字段嵌入未转义引号 / max_tokens 截断
 - **AWS Bedrock / Anthropic 双后端** 一键切换；本地 SentenceTransformer 兜底，无 OpenAI key 也能跑
 
 ---
@@ -38,16 +65,43 @@ docker compose up
 ### 方式 B：Python 直跑
 
 ```bash
-pip install -r requirements.txt streamlit
+pip install -r requirements.txt
 
-cp .env.example .env  # 填入凭证
+cp .env.example .env
 
-# 1) 跑批处理生成基线 JSON（OCR + QA + 审查）
+# 1. 默认全套（parser + indexer + qa + audit + reflection）
 python3 src/main.py
 
-# 2) 启 Web demo
+# 2. LLM-driven 计划（PlannerAgent 看 --request 决定跑哪些 agent）
+python3 src/main.py --request "我只想做合规审查"
+python3 src/main.py --request "对比新旧两份合同的条款变化"  # 触发 DiffAgent
+
+# 3. 用 LangGraph 编排器跑（默认是自研 Orchestrator）
+python3 src/main.py --orchestrator langgraph --request "审查重点关注金额一致性"
+
+# 4. 只调试某些 agent
+python3 src/main.py --skip-ocr --no-review   # 复用已解析数据，只跑 QA
+python3 src/main.py --skip-ocr --no-qa       # 只跑审查 + 反思
+
+# 5. Web demo
 streamlit run src/app.py
 ```
+
+---
+
+## 🧩 7 个 Agent 介绍
+
+| Agent | 职责 | 触发条件 |
+|---|---|---|
+| `PlannerAgent` | LLM 看用户 `--request` 自然语言需求，输出执行计划 + reasoning | 提供 `--request` 或 `--use-planner` |
+| `ParserAgent` | PyMuPDF 渲染 + Claude Vision OCR + 跨页表合并；单页缓存 | plan 含 parser |
+| `IndexerAgent` | 语义分块（同节合并 + 表格独立 + overlap）+ ChromaDB + BM25 | plan 含 indexer |
+| `QAAgent` | Q1 simple / Q2 multi-turn（含改写）/ Q3 complex（子问题分解） | plan 含 qa |
+| `AuditAgent` | 10 维度独立检索 + 独立 LLM 调用 + 引用回链 | plan 含 audit |
+| `DiffAgent` | v1/v2 章节对齐 + LLM 条款级对比 + chunk 回链 | plan 含 diff（需 v2） |
+| `ReflectionAgent` | 检视风险列表的重复/严重度冲突/遗漏；触发 audit 重跑（ReAct） | audit 之后 |
+
+所有 agent 共享 `SharedState`，每个 agent 的 invoke 日志写到 `outputs/agent_trace.json` 便于审计。
 
 ---
 

@@ -1,16 +1,35 @@
 ---
+title: Multi-Agent Workflow (LangGraph + 自研 BaseAgent)
 config:
   flowchart:
     curve: linear
 ---
 graph TD;
-	__start__([<p>__start__</p>]):::first
-	parser(parser)
-	indexer(indexer)
-	__end__([<p>__end__</p>]):::last
-	__start__ --> parser;
-	parser --> indexer;
-	indexer --> __end__;
-	classDef default fill:#f2f0ff,line-height:1.2
-	classDef first fill-opacity:0
-	classDef last fill:#bfb6fc
+    Start([START]):::start --> Planner
+
+    Planner["🧠 PlannerAgent<br/>LLM 看 user_request<br/>生成执行计划"]:::planner
+
+    Planner -->|plan| Parser["📄 ParserAgent<br/>Vision OCR + 跨页表合并"]:::parser
+    Parser --> Indexer["🔍 IndexerAgent<br/>分块 + Chroma + BM25"]:::indexer
+
+    Indexer -.->|qa in plan| QA["💬 QAAgent<br/>Q1 simple / Q2 multi-turn /<br/>Q3 complex（子问题分解）"]:::qa
+    Indexer -.->|audit in plan| Audit["⚠️ AuditAgent<br/>10 维度风险审查<br/>引用回链 chunk_id+quote"]:::audit
+    Indexer -.->|diff in plan| Diff["🔀 DiffAgent<br/>v1 vs v2 条款级对比"]:::diff
+
+    Audit --> Reflection["🪞 ReflectionAgent<br/>检查重复/冲突/遗漏"]:::reflect
+
+    Reflection -.->|needs_rerun=audit| Audit
+    Reflection -->|reviewed| End
+
+    QA --> End([END]):::endnode
+    Diff --> End
+
+    classDef start fill:#dcfce7,stroke:#16a34a
+    classDef endnode fill:#fce7f3,stroke:#be185d
+    classDef planner fill:#fef3c7,stroke:#d97706
+    classDef parser fill:#dbeafe,stroke:#2563eb
+    classDef indexer fill:#dbeafe,stroke:#2563eb
+    classDef qa fill:#e0e7ff,stroke:#4f46e5
+    classDef audit fill:#fee2e2,stroke:#dc2626
+    classDef diff fill:#f3e8ff,stroke:#7c3aed
+    classDef reflect fill:#fef3c7,stroke:#d97706,stroke-dasharray: 5 5

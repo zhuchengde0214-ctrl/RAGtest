@@ -40,18 +40,32 @@ class ParserAgent(BaseAgent):
             blocks=len(state.parsed_doc.blocks),
         )
 
-        # --- 第二份合同（阶段 4 diff 才会有） ---
-        if state.pdf_path_v2:
-            cached_v2 = output_dir / "parsed_document_v2.json"
+        # --- 第二份合同（阶段 4 diff 才会有）---
+        # 三种情况：
+        # (a) pdf_path_v2 存在 + outputs/parsed_document_v2.json 同源缓存 → 复用缓存
+        # (b) pdf_path_v2 存在但无缓存 → 调 Vision OCR 解析
+        # (c) pdf_path_v2 为空 / 不存在但 outputs/parsed_document_v2.json 已就绪
+        #     → 直接加载缓存（适用于"用 scripts/make_v2.py 生成的合成 v2"场景）
+        cached_v2 = output_dir / "parsed_document_v2.json"
+        v2_pdf_ok = bool(state.pdf_path_v2 and os.path.exists(state.pdf_path_v2))
+
+        if v2_pdf_ok:
             if cached_v2.exists() and self._is_same_pdf(state.pdf_path_v2, cached_v2):
                 state.parsed_doc_v2 = load_parsed_document(str(cached_v2))
                 state.log(self.name, f"v2 复用缓存：{cached_v2.name}")
             else:
                 state.parsed_doc_v2 = parser.parse(state.pdf_path_v2)
                 parser.save_parsed_document(state.parsed_doc_v2, str(cached_v2))
+                state.log(self.name, "v2 OCR 解析完成")
+        elif cached_v2.exists():
+            # 没有真实 v2.pdf，但有合成 v2 JSON
+            state.parsed_doc_v2 = load_parsed_document(str(cached_v2))
+            state.log(self.name, f"v2 合成数据：复用 {cached_v2.name}")
+
+        if state.parsed_doc_v2 is not None:
             state.log(
                 self.name,
-                "v2 合同解析完成",
+                "v2 合同就绪",
                 pages=state.parsed_doc_v2.total_pages,
                 blocks=len(state.parsed_doc_v2.blocks),
             )

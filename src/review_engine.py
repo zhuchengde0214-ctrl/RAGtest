@@ -243,6 +243,10 @@ class ReviewEngine:
             focus=dim["focus"],
             chunks=self._format_chunks(candidates),
         )
+        # ReAct hint 注入：如果 ReflectionAgent 设置了环境变量，前置加到 prompt
+        hint = os.environ.get("REVIEW_REFLECTION_HINT")
+        if hint:
+            prompt = f"{hint}\n\n{prompt}"
         try:
             resp = self.client.messages.create(
                 model=self.model,

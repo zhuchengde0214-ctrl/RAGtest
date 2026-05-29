@@ -20,6 +20,9 @@ from .parser_agent import ParserAgent
 from .indexer_agent import IndexerAgent
 from .qa_agent import QAAgent
 from .audit_agent import AuditAgent
+from .planner_agent import PlannerAgent
+from .diff_agent import DiffAgent
+from .reflection_agent import ReflectionAgent
 from .orchestrator import Orchestrator
 
 __all__ = [
@@ -30,5 +33,8 @@ __all__ = [
     "IndexerAgent",
     "QAAgent",
     "AuditAgent",
+    "PlannerAgent",
+    "DiffAgent",
+    "ReflectionAgent",
     "Orchestrator",
 ]
