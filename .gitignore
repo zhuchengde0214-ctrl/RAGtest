@@ -3,6 +3,15 @@
 .env.*
 !.env.example
 
+# 中间产物
+outputs/
+**/chroma_db/
+**/.ocr_cache/
+
+# Python
+**/__pycache__/
+*.pyc
+*.pyo
 
 # 编辑器
 .vscode/
@@ -12,3 +21,6 @@
 # 大文件
 python-portable/
 *.log
+
+# Streamlit secrets 等
+.streamlit/secrets.toml
