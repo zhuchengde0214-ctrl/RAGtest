@@ -1,0 +1,20 @@
+services:
+  contract-rag:
+    build: .
+    image: contract-rag:latest
+    container_name: contract-rag
+    ports:
+      - "8501:8501"
+    env_file:
+      - .env
+    volumes:
+      # 输入：PDF 与可能的本地配置
+      - ./data:/app/data:ro
+      # 输出：解析结果 / chunks / chroma_db / OCR 缓存（持久化）
+      - ./outputs:/app/outputs
+      # 评估集
+      - ./evals:/app/evals
+    restart: unless-stopped
+    # AWS Bedrock 凭证：如使用 IAM role 不需要这里挂；如使用 access key，从 .env 读
+    # 也可以挂 ~/.aws：
+    # - ~/.aws:/root/.aws:ro

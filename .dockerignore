@@ -1,0 +1,12 @@
+.git/
+.gitignore
+.env
+outputs/
+**/__pycache__/
+**/*.pyc
+**/.ocr_cache/
+.vscode/
+.idea/
+*.log
+data/*.pdf
+!data/.gitkeep

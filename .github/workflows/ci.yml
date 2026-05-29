@@ -1,0 +1,95 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  lint-and-smoke:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.9", "3.11"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+
+      - name: Install minimal deps for static checks
+        run: |
+          python -m pip install --upgrade pip
+          # 只装编译/import 检查需要的轻依赖，不装 sentence-transformers / chromadb 这些重的
+          pip install pymupdf jieba rank-bm25 python-dotenv numpy
+
+      - name: Compile all Python sources
+        run: |
+          python -m py_compile src/*.py
+
+      - name: Smoke test — chunker pure logic
+        run: |
+          python - <<'PY'
+          import sys; sys.path.insert(0, 'src')
+          from pdf_parser import ParsedDocument, TextBlock
+          from chunker import DocumentChunker
+
+          blocks = [
+              TextBlock(block_id="p1_b0", block_type="section_title",
+                        section_path="第一章", page=1, content="第一章 总则"),
+              TextBlock(block_id="p1_b1", block_type="paragraph",
+                        section_path="第一章", page=1,
+                        content="本合同总价 100 万元，付款分三期。"),
+              TextBlock(block_id="p2_b0", block_type="table",
+                        section_path="第二章", page=2,
+                        content="| 项目 | 金额 |\n| --- | --- |\n| 软件 | 60 |",
+                        metadata={"table_id": "tbl_p2_b0"}),
+          ]
+          pd = ParsedDocument(filename="t.pdf", total_pages=2, blocks=blocks, raw_text="")
+          chunks = DocumentChunker().chunk(pd)
+          assert len(chunks) >= 2, f"expected >=2 chunks, got {len(chunks)}"
+          # 表格独立成块
+          assert any(c.metadata["block_type"] == "table" for c in chunks), "table not preserved"
+          # chunk_id 已分配
+          for c in chunks:
+              assert c.chunk_id.startswith("chunk_"), f"bad chunk_id {c.chunk_id}"
+          print(f"OK: {len(chunks)} chunks generated")
+          PY
+
+      - name: Smoke test — tokenize_chinese (no embedding model)
+        run: |
+          python - <<'PY'
+          import sys; sys.path.insert(0, 'src')
+          from retriever import tokenize_chinese
+          tokens = tokenize_chinese("合同金额壹佰贰拾万元")
+          assert len(tokens) > 5, f"too few tokens: {tokens}"
+          assert "合同" in tokens or "金额" in tokens, f"missing key tokens: {tokens}"
+          print(f"OK: {len(tokens)} tokens")
+          PY
+
+      - name: Smoke test — JSON repair functions
+        run: |
+          python - <<'PY'
+          import sys, json
+          sys.path.insert(0, 'src')
+          from qa_engine import _repair_truncated_json, _escape_inner_quotes
+
+          # 截断修复
+          truncated = '[{"a": 1, "b": 2}, {"c": 3'
+          repaired = _repair_truncated_json(truncated)
+          assert repaired is not None, "repair returned None"
+          d = json.loads(repaired)
+          assert isinstance(d, list) and len(d) == 1, f"unexpected: {d}"
+
+          # 嵌套引号修复
+          bad = '[{"x": "正文"内嵌"引号"}]'
+          fixed = _escape_inner_quotes(bad)
+          d2 = json.loads(fixed)
+          assert isinstance(d2, list)
+          print("OK")
+          PY

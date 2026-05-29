@@ -1,0 +1,10 @@
+{"id": "G01", "question": "本合同的甲方和乙方分别是哪家公司？", "expected_answer_keywords": ["海岳数智运营有限公司", "星瀚智印科技有限公司"], "expected_section_substring": "合同主体", "type": "fact"}
+{"id": "G02", "question": "本合同的总价是多少？", "expected_answer_keywords": ["1,280,000", "壹佰贰拾万", "128"], "expected_section_substring": "合同金额", "type": "fact"}
+{"id": "G03", "question": "项目交付期限是多少天？", "expected_answer_keywords": ["45", "自然日"], "expected_section_substring": "交付期限", "type": "fact"}
+{"id": "G04", "question": "付款分几期？每期比例是多少？", "expected_answer_keywords": ["30%", "40%", "30%", "三期"], "expected_section_substring": "付款", "type": "fact"}
+{"id": "G05", "question": "甲方和乙方的统一社会信用代码分别是什么？", "expected_answer_keywords": ["91310000MAY202605", "91310115MAZH202626"], "expected_section_substring": "合同主体", "type": "fact"}
+{"id": "G06", "question": "本项目要交付的能力有哪些？", "expected_answer_keywords": ["智能印章", "用印", "合同台账", "知识库", "合同审查", "接口", "审计"], "expected_section_substring": "项目范围", "type": "list"}
+{"id": "G07", "question": "本项目首批要接入多少枚实体印章和多少个合同审查账号？", "expected_answer_keywords": ["80", "20", "印章", "账号"], "expected_section_substring": "项目范围", "type": "fact"}
+{"id": "G08", "question": "如果甲方没有及时提供网络环境或审批系统接口，会怎样？", "expected_answer_keywords": ["顺延", "3 个工作日", "书面"], "expected_section_substring": "交付期限", "type": "reasoning"}
+{"id": "G09", "question": "合同金额大写和小写是否一致？", "expected_answer_keywords": ["不一致", "1,280,000", "壹佰贰拾万", "120"], "expected_section_substring": "合同金额", "type": "reasoning"}
+{"id": "G10", "question": "若发票信息与合同主体不一致，甲方有什么权利？", "expected_answer_keywords": ["暂停付款", "更正"], "expected_section_substring": "合同金额", "type": "fact"}
