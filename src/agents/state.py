@@ -27,10 +27,19 @@ class SharedState:
 
     # ---------------- 输入 ----------------
     pdf_path: str = ""
-    pdf_path_v2: Optional[str] = None      # 阶段 4 用：第二份合同（diff 对象）
-    user_request: str = ""                 # 阶段 3 用：自然语言需求
+    pdf_path_v2: Optional[str] = None      # 第二份合同（diff 对象）
+    user_request: str = ""                 # 自然语言需求
     output_dir: str = "outputs"
     cache_dir: Optional[str] = None
+
+    # 长期记忆：合同 ID（来自 ContractLibrary）
+    contract_id: Optional[str] = None
+    contract_id_v2: Optional[str] = None
+
+    # ---------------- IntentRouter 产物 ----------------
+    intent: Optional[str] = None           # contract_related | off_topic
+    intent_reasoning: str = ""
+    lite_reply: str = ""                   # off_topic 时的轻量回复
 
     # ---------------- 阶段 3 PlannerAgent 产物 ----------------
     plan: list[str] = field(default_factory=list)       # ["parser","indexer","qa","audit"]

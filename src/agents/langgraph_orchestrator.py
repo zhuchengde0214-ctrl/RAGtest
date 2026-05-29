@@ -25,6 +25,7 @@ from .audit_agent import AuditAgent
 from .base import BaseAgent
 from .diff_agent import DiffAgent
 from .indexer_agent import IndexerAgent
+from .intent_router import IntentRouter
 from .parser_agent import ParserAgent
 from .planner_agent import PlannerAgent
 from .qa_agent import QAAgent
@@ -100,17 +101,27 @@ class LangGraphOrchestrator:
         return builder.compile()
 
     def _build_with_planner(self):
-        """启用 planner：planner 节点 + 每个 agent 节点用条件边路由到 plan 里的下一个。"""
+        """启用 planner：intent_router → planner → agents（条件路由）。
+        intent=off_topic 时直接 END（IntentRouter 已经写了 lite_reply）。
+        """
         builder = StateGraph(SharedState)
 
-        # planner 节点
+        # 入口节点
+        builder.add_node("intent_router", _agent_node(IntentRouter()))
         builder.add_node("planner", _agent_node(PlannerAgent()))
 
-        # 所有可能用到的 agent 都注册（即使 plan 里没用到也无妨——graph 只走被路由到的）
+        # 业务 agent 节点
         for name, cls in AGENT_REGISTRY.items():
             builder.add_node(name, _agent_node(cls()))
 
-        builder.set_entry_point("planner")
+        builder.set_entry_point("intent_router")
+
+        # intent_router → planner（contract_related）/ END（off_topic）
+        builder.add_conditional_edges(
+            "intent_router",
+            self._router_after_intent,
+            {"planner": "planner", "__end__": END},
+        )
 
         # planner → 第一个 agent（条件路由）
         builder.add_conditional_edges(
@@ -128,6 +139,12 @@ class LangGraphOrchestrator:
             )
 
         return builder.compile()
+
+    @staticmethod
+    def _router_after_intent(state: SharedState) -> str:
+        if state.intent == "off_topic":
+            return "__end__"
+        return "planner"
 
     # ------------------------------------------------------------------
     # 路由函数

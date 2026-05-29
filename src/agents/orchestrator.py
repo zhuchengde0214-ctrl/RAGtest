@@ -14,6 +14,7 @@ from .audit_agent import AuditAgent
 from .base import BaseAgent
 from .diff_agent import DiffAgent
 from .indexer_agent import IndexerAgent
+from .intent_router import IntentRouter
 from .parser_agent import ParserAgent
 from .planner_agent import PlannerAgent
 from .qa_agent import QAAgent
@@ -51,6 +52,13 @@ class Orchestrator:
         self.plan = plan or (None if use_planner else self.DEFAULT_PLAN)
 
     def run(self, state: SharedState) -> SharedState:
+        # 0. IntentRouter（仅在启用 planner 时；显式 plan 模式跳过 router）
+        if self.use_planner and state.user_request.strip():
+            IntentRouter().invoke(state)
+            if state.intent == "off_topic":
+                self._dump_messages(state)
+                return state
+
         # 1. （可选）先跑 PlannerAgent 决定 plan
         if self.use_planner:
             planner = PlannerAgent()

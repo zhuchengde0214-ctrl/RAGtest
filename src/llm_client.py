@@ -26,6 +26,18 @@ def get_default_model() -> str:
     return os.environ.get("ANTHROPIC_MODEL", "claude-sonnet-4-6")
 
 
+def get_lite_model() -> str:
+    """返回轻量模型（用于 IntentRouter / 简单分类 / 闲聊回复）。
+    Haiku 价格约为 Sonnet 的 1/8，速度快 3 倍。
+    """
+    if _is_bedrock():
+        return os.environ.get(
+            "BEDROCK_LITE_MODEL_ID",
+            "us.anthropic.claude-haiku-4-5-20251001-v1:0",
+        )
+    return os.environ.get("ANTHROPIC_LITE_MODEL", "claude-haiku-4-5")
+
+
 def make_llm_client(api_key: Optional[str] = None):
     """生成 LLM 客户端。
     - Bedrock: 使用 IAM/STS 凭证（不需要 api_key），区域取自 AWS_REGION 或 BEDROCK_REGION

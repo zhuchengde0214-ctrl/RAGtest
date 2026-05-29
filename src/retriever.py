@@ -120,12 +120,14 @@ class Retriever:
         bm25_top_k: int = 10,
         rerank_top_k: int = 6,
         rrf_k: int = 60,
+        collection_name: str = "contract_docs",
     ):
         self.embedding_provider = embedding_provider
         self.vector_top_k = vector_top_k
         self.bm25_top_k = bm25_top_k
         self.rerank_top_k = rerank_top_k
         self.rrf_k = rrf_k
+        self.collection_name = collection_name
 
         try:
             self.chroma_client = chromadb.PersistentClient(
@@ -147,12 +149,16 @@ class Retriever:
     # ------------------------------------------------------------------
     # 索引
     # ------------------------------------------------------------------
-    def index(self, chunks: list[Chunk]):
+    def index(self, chunks: list[Chunk], reuse_existing: bool = False):
+        """建立索引。
+        reuse_existing=True：如果 chroma collection 已存在且 count 与 chunks 数一致，跳过 dense 重建。
+                            BM25 必须每次重建（在内存里，无持久化）。
+        """
         self.chunks = chunks
         self._chunk_by_id = {c.chunk_id: c for c in chunks}
-        logger.info(f"建立索引，{len(chunks)} 个 chunk")
+        logger.info(f"建立索引（collection={self.collection_name}），{len(chunks)} 个 chunk")
 
-        # BM25
+        # BM25 - 必须重建（不持久化）
         tokenized = [tokenize_chinese(c.content) for c in chunks]
         self.bm25 = BM25Okapi(tokenized)
         logger.info("  BM25 索引完成")
@@ -162,13 +168,28 @@ class Retriever:
             logger.warning("  Dense 检索已禁用（embedding 不可用）")
             return
 
+        # 复用已有 collection（长期记忆场景）
+        if reuse_existing:
+            try:
+                existing = self.chroma_client.get_collection(self.collection_name)
+                if existing.count() == len(chunks):
+                    self.collection = existing
+                    logger.info(f"  复用已有 collection（{existing.count()} 个向量）")
+                    return
+                else:
+                    logger.info(
+                        f"  collection 已存在但数量不匹配（{existing.count()} vs {len(chunks)}），重建"
+                    )
+            except Exception:
+                logger.info(f"  collection {self.collection_name} 不存在，新建")
+
         try:
             try:
-                self.chroma_client.delete_collection("contract_docs")
+                self.chroma_client.delete_collection(self.collection_name)
             except Exception:
                 pass
             self.collection = self.chroma_client.create_collection(
-                name="contract_docs",
+                name=self.collection_name,
                 metadata={"hnsw:space": "cosine"},
             )
             batch = 32

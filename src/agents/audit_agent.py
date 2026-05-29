@@ -53,7 +53,7 @@ class AuditAgent(BaseAgent):
 
         state.risks = risks
 
-        out_path = Path(state.output_dir) / "review_results.json"
+        out_path = self._output_path(state)
         with open(out_path, "w", encoding="utf-8") as f:
             json.dump(risks, f, ensure_ascii=False, indent=2)
 
@@ -68,3 +68,13 @@ class AuditAgent(BaseAgent):
             severity=sev_count,
             iter=state.reflection_iters,
         )
+
+    @staticmethod
+    def _output_path(state):
+        if state.contract_id:
+            from contract_library import ContractLibrary
+            lib = ContractLibrary()
+            paths = lib.paths(state.contract_id)
+            paths["base"].mkdir(parents=True, exist_ok=True)
+            return paths["review_results"]
+        return Path(state.output_dir) / "review_results.json"

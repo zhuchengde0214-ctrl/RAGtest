@@ -8,6 +8,12 @@ outputs/
 **/chroma_db/
 **/.ocr_cache/
 
+# 用户上传的合同（不提交，保留 .gitkeep）
+data/uploads/
+
+# LangGraph 自动生成的 mermaid（用 docs/agent_workflow.mmd 手写版）
+docs/agent_workflow_generated.mmd
+
 # Python
 **/__pycache__/
 *.pyc

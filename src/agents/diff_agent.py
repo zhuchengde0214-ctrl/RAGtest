@@ -150,7 +150,7 @@ class DiffAgent(BaseAgent):
         state.diff_results = diffs
 
         # 落盘
-        out = Path(state.output_dir) / "diff_results.json"
+        out = self._output_path(state)
         out.write_text(
             json.dumps(diffs, ensure_ascii=False, indent=2), encoding="utf-8"
         )
@@ -164,6 +164,16 @@ class DiffAgent(BaseAgent):
             n_section_added=sum(1 for d in diffs if d.get("diff_type") == "added_section"),
             n_section_removed=sum(1 for d in diffs if d.get("diff_type") == "removed_section"),
         )
+
+    @staticmethod
+    def _output_path(state):
+        if state.contract_id:
+            from contract_library import ContractLibrary
+            lib = ContractLibrary()
+            paths = lib.paths(state.contract_id)
+            paths["base"].mkdir(parents=True, exist_ok=True)
+            return paths["diff_results"]
+        return Path(state.output_dir) / "diff_results.json"
 
     # ------------------------------------------------------------------
     @staticmethod

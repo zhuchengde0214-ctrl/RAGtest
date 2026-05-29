@@ -1,12 +1,20 @@
 """ParserAgent：调用 Vision OCR 解析 PDF。
 
-包装 src/pdf_parser.py 的 PDFParser，扫描件直接走 Vision，缓存到磁盘。
-若 state.pdf_path_v2 存在，同时解析两份合同（阶段 4 diff 用）。
+支持两种模式：
+1. ContractLibrary 模式（推荐）
+   state.contract_id 给定 → 用 lib.paths(contract_id) 决定文件位置
+   产物落到 outputs/contracts/<id>/parsed_document.json
+   OCR 缓存落到 outputs/contracts/<id>/ocr_cache/
+2. 旧的 output_dir 模式（向后兼容 CLI / eval）
+   产物落到 state.output_dir/parsed_document.json
+
+若 state.pdf_path_v2 / contract_id_v2 存在，同时解析 v2（diff 用）。
 """
 
 import os
 from pathlib import Path
 
+from contract_library import ContractLibrary
 from llm_client import get_default_model
 from pdf_parser import PDFParser, load_parsed_document
 
@@ -18,50 +26,40 @@ class ParserAgent(BaseAgent):
     name = "parser"
 
     def _run(self, state: SharedState) -> None:
-        output_dir = Path(state.output_dir)
-        output_dir.mkdir(parents=True, exist_ok=True)
-        cache_dir = state.cache_dir or str(output_dir / ".ocr_cache")
+        parser = PDFParser(model=get_default_model())
 
-        parser = PDFParser(model=get_default_model(), cache_dir=cache_dir)
-
-        # --- 主合同 ---
-        cached_path = output_dir / "parsed_document.json"
-        if cached_path.exists() and self._is_same_pdf(state.pdf_path, cached_path):
-            state.parsed_doc = load_parsed_document(str(cached_path))
-            state.log(self.name, f"复用缓存：{cached_path.name}")
-        else:
-            state.parsed_doc = parser.parse(state.pdf_path)
-            parser.save_parsed_document(state.parsed_doc, str(cached_path))
-
-        state.log(
-            self.name,
-            f"主合同解析完成",
-            pages=state.parsed_doc.total_pages,
-            blocks=len(state.parsed_doc.blocks),
+        # ---- 主合同 ----
+        self._parse_one(
+            state, parser,
+            pdf_path=state.pdf_path,
+            contract_id=state.contract_id,
+            doc_attr="parsed_doc",
+            label="主合同",
         )
 
-        # --- 第二份合同（阶段 4 diff 才会有）---
-        # 三种情况：
-        # (a) pdf_path_v2 存在 + outputs/parsed_document_v2.json 同源缓存 → 复用缓存
-        # (b) pdf_path_v2 存在但无缓存 → 调 Vision OCR 解析
-        # (c) pdf_path_v2 为空 / 不存在但 outputs/parsed_document_v2.json 已就绪
-        #     → 直接加载缓存（适用于"用 scripts/make_v2.py 生成的合成 v2"场景）
-        cached_v2 = output_dir / "parsed_document_v2.json"
-        v2_pdf_ok = bool(state.pdf_path_v2 and os.path.exists(state.pdf_path_v2))
-
-        if v2_pdf_ok:
-            if cached_v2.exists() and self._is_same_pdf(state.pdf_path_v2, cached_v2):
+        # ---- v2（如果有）----
+        if state.pdf_path_v2 or state.contract_id_v2:
+            self._parse_one(
+                state, parser,
+                pdf_path=state.pdf_path_v2 or "",
+                contract_id=state.contract_id_v2,
+                doc_attr="parsed_doc_v2",
+                label="v2 合同",
+            )
+        else:
+            # 向后兼容：旧逻辑，看 outputs/parsed_document_v2.json 是否存在
+            cached_v2 = Path(state.output_dir) / "parsed_document_v2.json"
+            if cached_v2.exists():
                 state.parsed_doc_v2 = load_parsed_document(str(cached_v2))
-                state.log(self.name, f"v2 复用缓存：{cached_v2.name}")
-            else:
-                state.parsed_doc_v2 = parser.parse(state.pdf_path_v2)
-                parser.save_parsed_document(state.parsed_doc_v2, str(cached_v2))
-                state.log(self.name, "v2 OCR 解析完成")
-        elif cached_v2.exists():
-            # 没有真实 v2.pdf，但有合成 v2 JSON
-            state.parsed_doc_v2 = load_parsed_document(str(cached_v2))
-            state.log(self.name, f"v2 合成数据：复用 {cached_v2.name}")
+                state.log(self.name, f"v2 复用旧版缓存：{cached_v2.name}")
 
+        if state.parsed_doc is not None:
+            state.log(
+                self.name,
+                "主合同就绪",
+                pages=state.parsed_doc.total_pages,
+                blocks=len(state.parsed_doc.blocks),
+            )
         if state.parsed_doc_v2 is not None:
             state.log(
                 self.name,
@@ -70,9 +68,68 @@ class ParserAgent(BaseAgent):
                 blocks=len(state.parsed_doc_v2.blocks),
             )
 
+    # ------------------------------------------------------------------
+    def _parse_one(
+        self, state: SharedState, parser: PDFParser,
+        pdf_path: str, contract_id: "str | None",
+        doc_attr: str, label: str,
+    ):
+        """解析一份 PDF，写到 state.<doc_attr>。优先 ContractLibrary 模式。"""
+        if contract_id:
+            lib = ContractLibrary()
+            info = lib.get(contract_id)
+            if info is None:
+                state.log(self.name, f"{label}：未找到 contract_id={contract_id}", level="error")
+                state.errors.append(f"{label}：contract_id 未注册")
+                return
+
+            paths = lib.paths(contract_id)
+            parsed_path = paths["parsed_document"]
+            ocr_cache = paths["ocr_cache"]
+            ocr_cache.mkdir(parents=True, exist_ok=True)
+
+            if parsed_path.exists():
+                doc = load_parsed_document(str(parsed_path))
+                setattr(state, doc_attr, doc)
+                lib.touch(contract_id)
+                state.log(self.name, f"{label} 复用长期记忆：{paths['base'].name}/parsed_document.json")
+                return
+
+            # 需要重新 OCR
+            actual_pdf = info.pdf_path
+            parser.cache_dir = ocr_cache  # 覆盖 cache_dir
+            doc = parser.parse(actual_pdf)
+            parser.save_parsed_document(doc, str(parsed_path))
+            lib.update(
+                contract_id,
+                pages=doc.total_pages,
+                status="parsed",
+            )
+            setattr(state, doc_attr, doc)
+            return
+
+        # 旧模式：直接用 pdf_path + state.output_dir
+        if not pdf_path:
+            state.log(self.name, f"{label}：无 pdf_path 也无 contract_id，跳过", level="warning")
+            return
+
+        output_dir = Path(state.output_dir)
+        output_dir.mkdir(parents=True, exist_ok=True)
+        cache_dir = state.cache_dir or str(output_dir / ".ocr_cache")
+        parser.cache_dir = Path(cache_dir)
+        parser.cache_dir.mkdir(parents=True, exist_ok=True)
+
+        cached_path = output_dir / ("parsed_document.json" if doc_attr == "parsed_doc" else "parsed_document_v2.json")
+        if cached_path.exists() and self._is_same_pdf(pdf_path, cached_path):
+            doc = load_parsed_document(str(cached_path))
+            state.log(self.name, f"{label} 复用缓存：{cached_path.name}")
+        else:
+            doc = parser.parse(pdf_path)
+            parser.save_parsed_document(doc, str(cached_path))
+        setattr(state, doc_attr, doc)
+
     @staticmethod
     def _is_same_pdf(pdf_path: str, parsed_json: Path) -> bool:
-        """检查缓存的 parsed_document.json 与当前 pdf_path 同源（按文件名 + mtime 简单判断）。"""
         if not pdf_path or not os.path.exists(pdf_path):
             return False
         try:

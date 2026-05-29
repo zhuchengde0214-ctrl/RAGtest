@@ -23,6 +23,7 @@ from .audit_agent import AuditAgent
 from .planner_agent import PlannerAgent
 from .diff_agent import DiffAgent
 from .reflection_agent import ReflectionAgent
+from .intent_router import IntentRouter
 from .orchestrator import Orchestrator
 
 __all__ = [
@@ -36,5 +37,6 @@ __all__ = [
     "PlannerAgent",
     "DiffAgent",
     "ReflectionAgent",
+    "IntentRouter",
     "Orchestrator",
 ]

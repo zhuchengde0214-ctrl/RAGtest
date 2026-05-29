@@ -46,7 +46,7 @@ class QAAgent(BaseAgent):
         results.append(engine.answer_complex(Q3, state.retriever))
 
         state.qa_results = results
-        out_path = Path(state.output_dir) / "qa_results.json"
+        out_path = self._output_path(state)
         with open(out_path, "w", encoding="utf-8") as f:
             json.dump(results, f, ensure_ascii=False, indent=2)
 
@@ -62,3 +62,14 @@ class QAAgent(BaseAgent):
             n_questions=len(results),
             n_resolved_citations=n_resolved,
         )
+
+    @staticmethod
+    def _output_path(state):
+        """优先 ContractLibrary 路径，否则用 state.output_dir/qa_results.json。"""
+        if state.contract_id:
+            from contract_library import ContractLibrary
+            lib = ContractLibrary()
+            paths = lib.paths(state.contract_id)
+            paths["base"].mkdir(parents=True, exist_ok=True)
+            return paths["qa_results"]
+        return Path(state.output_dir) / "qa_results.json"
